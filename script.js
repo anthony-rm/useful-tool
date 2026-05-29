@@ -4,6 +4,8 @@
 // @version      2.0
 // @description  Extracts "Number of Games" odds from tennis match pages OR upcoming singles matches from the tennis sports page. Features dynamic UI, clipboard copy, dark/light theme, and scroll scanning.
 // @match        https://www.winamax.fr/*
+// @updateURL    https://raw.githubusercontent.com/anthony-rm/useful-tool/main/script.js
+// @downloadURL  https://raw.githubusercontent.com/anthony-rm/useful-tool/main/script.js
 // @grant        GM_setClipboard
 // ==/UserScript==
 
