@@ -279,21 +279,14 @@
         let crossedToTomorrow = false;
         let lastTimeMinutes = -1;
 
-        // Filter initial matches: only today's matches (no day indicator)
+        // Process initial visible matches
         let initialMatches = extractCurrentMatches();
         for (let m of initialMatches) {
             const key = `${m.player1}|${m.player2}|${m.tournament}|${m.round}`;
             allSeen.set(key, m);
             if (crossedToTomorrow) continue;
-            if (m.dayIndicator) {
-                // If the very first matches already have a day indicator,
-                // it means there are no matches today at all
-                crossedToTomorrow = true;
-                continue;
-            }
             const mins = timeToMinutes(m.matchTime);
             if (lastTimeMinutes !== -1 && mins < lastTimeMinutes) {
-                // Time went backwards: crossed midnight into next day
                 crossedToTomorrow = true;
                 continue;
             }
@@ -302,7 +295,6 @@
         }
         if (onProgress) onProgress(todayMatches.size);
 
-        // If we already crossed to tomorrow from initial view, stop early
         if (crossedToTomorrow) {
             if (scrollable === window) window.scrollTo(0, window.scrollY);
             return Array.from(todayMatches.values());
@@ -328,22 +320,13 @@
                 const key = `${m.player1}|${m.player2}|${m.tournament}|${m.round}`;
                 if (allSeen.has(key)) continue;
                 allSeen.set(key, m);
-
                 if (crossedToTomorrow) continue;
-
-                // Stop if we see a day indicator (Demain, lun., mar., etc.)
-                if (m.dayIndicator) {
-                    crossedToTomorrow = true;
-                    continue;
-                }
 
                 const mins = timeToMinutes(m.matchTime);
                 if (lastTimeMinutes !== -1 && mins < lastTimeMinutes) {
-                    // Time went backwards: crossed midnight into next day
                     crossedToTomorrow = true;
                     continue;
                 }
-
                 lastTimeMinutes = mins;
                 todayMatches.set(key, m);
                 added++;
