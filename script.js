@@ -267,18 +267,52 @@
         return matches;
     }
 
+    function timeToMinutes(timeStr) {
+        const parts = timeStr.split(':');
+        return parseInt(parts[0], 10) * 60 + parseInt(parts[1], 10);
+    }
+
     async function extractAllMatchesFromSports(onProgress) {
-        const allMatches = new Map();
+        const todayMatches = new Map();
+        const allSeen = new Map();
         const scrollable = findScrollableContainer();
+        let crossedToTomorrow = false;
+        let lastTimeMinutes = -1;
+
+        // Filter initial matches: only today's matches (no day indicator)
         let initialMatches = extractCurrentMatches();
-        for (let m of initialMatches) allMatches.set(`${m.player1}|${m.player2}|${m.tournament}|${m.round}`, m);
-        if (onProgress) onProgress(allMatches.size);
+        for (let m of initialMatches) {
+            const key = `${m.player1}|${m.player2}|${m.tournament}|${m.round}`;
+            allSeen.set(key, m);
+            if (crossedToTomorrow) continue;
+            if (m.dayIndicator) {
+                // If the very first matches already have a day indicator,
+                // it means there are no matches today at all
+                crossedToTomorrow = true;
+                continue;
+            }
+            const mins = timeToMinutes(m.matchTime);
+            if (lastTimeMinutes !== -1 && mins < lastTimeMinutes) {
+                // Time went backwards: crossed midnight into next day
+                crossedToTomorrow = true;
+                continue;
+            }
+            lastTimeMinutes = mins;
+            todayMatches.set(key, m);
+        }
+        if (onProgress) onProgress(todayMatches.size);
+
+        // If we already crossed to tomorrow from initial view, stop early
+        if (crossedToTomorrow) {
+            if (scrollable === window) window.scrollTo(0, window.scrollY);
+            return Array.from(todayMatches.values());
+        }
 
         let noNewCount = 0;
         const MAX_NO_NEW = 8;
         const originalScrollTop = (scrollable === window) ? window.scrollY : scrollable.scrollTop;
 
-        while (noNewCount < MAX_NO_NEW) {
+        while (noNewCount < MAX_NO_NEW && !crossedToTomorrow) {
             let oldScrollTop = (scrollable === window) ? window.scrollY : scrollable.scrollTop;
             if (scrollable === window) window.scrollBy(0, 1000);
             else scrollable.scrollBy({ top: 1000, behavior: 'auto' });
@@ -292,12 +326,32 @@
             let added = 0;
             for (let m of newMatches) {
                 const key = `${m.player1}|${m.player2}|${m.tournament}|${m.round}`;
-                if (!allMatches.has(key)) { allMatches.set(key, m); added++; }
+                if (allSeen.has(key)) continue;
+                allSeen.set(key, m);
+
+                if (crossedToTomorrow) continue;
+
+                // Stop if we see a day indicator (Demain, lun., mar., etc.)
+                if (m.dayIndicator) {
+                    crossedToTomorrow = true;
+                    continue;
+                }
+
+                const mins = timeToMinutes(m.matchTime);
+                if (lastTimeMinutes !== -1 && mins < lastTimeMinutes) {
+                    // Time went backwards: crossed midnight into next day
+                    crossedToTomorrow = true;
+                    continue;
+                }
+
+                lastTimeMinutes = mins;
+                todayMatches.set(key, m);
+                added++;
             }
             if (added === 0) noNewCount++;
             else noNewCount = 0;
 
-            if (onProgress) onProgress(allMatches.size);
+            if (onProgress) onProgress(todayMatches.size);
 
             let atBottom = (scrollable === window) ?
                 (window.innerHeight + window.scrollY >= document.body.scrollHeight - 100) :
@@ -308,7 +362,7 @@
         if (scrollable === window) window.scrollTo(0, originalScrollTop);
         else scrollable.scrollTop = originalScrollTop;
 
-        return Array.from(allMatches.values());
+        return Array.from(todayMatches.values());
     }
 
     function formatMatches(matches) {
