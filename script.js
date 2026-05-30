@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         Winamax Tennis Tools Beta
+// @name         Winamax Tennis Tools
 // @namespace    http://tampermonkey.net/
 // @version      3.0
 // @description  Extracts "Number of Games" & "Game Spread" odds from tennis match pages OR upcoming singles matches from the tennis sports page. Features dynamic UI, clipboard copy, dark/light theme, and scroll scanning.
