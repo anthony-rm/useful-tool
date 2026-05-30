@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Winamax Tennis Tools
+// @name         Winamax Tennis Tools Beta
 // @namespace    http://tampermonkey.net/
-// @version      2.1
-// @description  Extracts "Number of Games" odds from tennis match pages OR upcoming singles matches from the tennis sports page. Features dynamic UI, clipboard copy, dark/light theme, and scroll scanning.
+// @version      2.2
+// @description  Extracts "Number of Games" & "Game Spread" odds from tennis match pages OR upcoming singles matches from the tennis sports page. Features dynamic UI, clipboard copy, dark/light theme, and scroll scanning.
 // @match        https://www.winamax.fr/*
 // @updateURL    https://raw.githubusercontent.com/anthony-rm/useful-tool/main/script.js
 // @downloadURL  https://raw.githubusercontent.com/anthony-rm/useful-tool/main/script.js
@@ -51,11 +51,18 @@
     let uiContainer = null;
     let progressDiv = null;
     let actionBtn = null;      // primary button (Extract)
-    let copyBtn = null;        // secondary button (Copy)
     let progressTimeout = null;
     let currentMode = null;
     let lastExtractedData = '';   // for match mode
     let extractedMatches = [];     // for sports mode
+    let oddsMode = 'all';          // 'all', 'over', 'under' for match mode
+    let modeSelectorDiv = null;    // mode toggle UI container
+    let sectionType = 'nombre-de-jeux'; // 'nombre-de-jeux' or 'ecart-de-jeux'
+    let sectionSelectorDiv = null;     // section toggle UI container
+    let spreadFilter = 'all';          // 'all', 'player1', 'player2' for spread mode
+    let spreadFilterDiv = null;        // spread filter UI container
+    let spreadPlayer1Name = '';        // detected player 1 name
+    let spreadPlayer2Name = '';        // detected player 2 name
 
     // --- Theming --------------------------------------------------------
     function updateProgressTheme() {
@@ -84,7 +91,6 @@
     // --- Match page extraction (Nombre de jeux odds) --------------------
     async function extractOddsFromMatch() {
         try {
-            showProgress("🔍 Searching for 'Nombre de jeux' section...");
 
             const heading = await waitForXPath("//div[contains(text(),'Nombre de jeux')]");
             if (!heading) throw new Error("Heading 'Nombre de jeux' not found");
@@ -104,7 +110,6 @@
                 let toggleClicked = false;
                 for (let toggle of possibleToggles) {
                     if (toggle.click && toggle.innerText === '') {
-                        showProgress("🔄 Switching to list view...");
                         toggle.click();
                         await sleep(500);
                         toggleClicked = true;
@@ -114,7 +119,6 @@
                 if (!toggleClicked) {
                     const fallbackToggle = document.evaluate(".//*[contains(@class, 'hukOGC')]", sectionContainer, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
                     if (fallbackToggle && fallbackToggle.click) {
-                        showProgress("🔄 Switching to list view (fallback)...");
                         fallbackToggle.click();
                         await sleep(500);
                     }
@@ -129,7 +133,6 @@
                 ).singleNodeValue;
                 if (!expandBtn) break;
                 if (expandBtn.innerText.trim().includes("Plus de sélections")) {
-                    showProgress(`📂 Expanding selections (step ${i+1}/10)...`);
                     expandBtn.click();
                     await sleep(400);
                     const newOdds = xpathNodes(".//div[starts-with(@data-testid, 'odd-button-')]", sectionContainer);
@@ -158,14 +161,224 @@
 
             if (oddsList.length === 0) throw new Error("No odds extracted");
 
-            lastExtractedData = oddsList.map(o => `${o.name} : ${o.value}`).join('\n');
+            // Group odds into Over (Plus de) and Under (Moins de)
+            const overOdds = oddsList.filter(o => o.name.includes('Plus de'));
+            const underOdds = oddsList.filter(o => o.name.includes('Moins de'));
+
+            // Sort each group by odd value ascending
+            const sortByValue = (a, b) => parseFloat(a.value.replace(',', '.')) - parseFloat(b.value.replace(',', '.'));
+            overOdds.sort(sortByValue);
+            underOdds.sort(sortByValue);
+
+            // Format a single odd with Over/Under label
+            const formatOdd = (o) => {
+                const label = o.name.includes('Plus de') ? 'Over' : 'Under';
+                const threshold = o.name.replace('Plus de ', '').replace('Moins de ', '');
+                return `${label} ${threshold} : ${o.value}`;
+            };
+
+            // Build output based on selected mode
+            let formattedOdds;
+            if (oddsMode === 'over') {
+                formattedOdds = overOdds.map(formatOdd);
+            } else if (oddsMode === 'under') {
+                formattedOdds = underOdds.map(formatOdd);
+            } else {
+                formattedOdds = [...overOdds.map(formatOdd), ...underOdds.map(formatOdd)];
+            }
+
+            lastExtractedData = formattedOdds.join('\n');
             GM_setClipboard(lastExtractedData, 'text');
-            showProgress(`✅ ${oddsList.length} odds copied!`);
-            if (copyBtn) copyBtn.style.display = 'block';
+            showProgress(`✅ ${formattedOdds.length} odds copied!`);
         } catch (err) {
             console.error(err);
             showProgress(`❌ Error: ${err.message}`, true);
-            if (copyBtn) copyBtn.style.display = 'none';
+        }
+    }
+
+    // --- Match page extraction (Écart de jeux odds) --------------------
+    function detectSpreadPlayerNames() {
+        // Try to find the "Écart de jeux" heading
+        const heading = document.evaluate("//div[contains(text(),'Écart de jeux')]", document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+        if (!heading) return;
+
+        // Find the section container
+        let sectionContainer = null;
+        let node = heading.parentNode;
+        while (node && node !== document.body) {
+            const hasOdds = document.evaluate(".//div[starts-with(@data-testid, 'odd-button-')]", node, null, XPathResult.BOOLEAN_TYPE, null).booleanValue;
+            if (hasOdds) { sectionContainer = node; break; }
+            node = node.parentNode;
+        }
+        if (!sectionContainer) return;
+
+        // Read existing odds (whatever is visible without clicking)
+        const oddsButtons = xpathNodes(".//div[starts-with(@data-testid, 'odd-button-')]", sectionContainer);
+        if (oddsButtons.length === 0) return;
+
+        const uniquePlayers = new Set();
+        for (const btn of oddsButtons) {
+            const valueSpan = document.evaluate(".//span[contains(@class, 'odd-button-value')]", btn, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+            if (!valueSpan) continue;
+            const valueContainer = valueSpan.parentElement;
+            const nameDiv = valueContainer.previousElementSibling;
+            let name = nameDiv ? nameDiv.textContent.trim() : '';
+            if (!name) {
+                const possibleNameDiv = document.evaluate(".//div[contains(text(),'+') or contains(text(),'-')]", btn, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                if (possibleNameDiv) name = possibleNameDiv.textContent.trim();
+            }
+            if (name) {
+                const match = name.match(/^(.+?)\s[+-]/);
+                if (match) uniquePlayers.add(match[1].trim());
+            }
+        }
+
+        const nameArray = Array.from(uniquePlayers).sort();
+        if (nameArray.length >= 2) {
+            spreadPlayer1Name = nameArray[0];
+            spreadPlayer2Name = nameArray[1];
+        } else if (nameArray.length === 1) {
+            spreadPlayer1Name = nameArray[0];
+        }
+        updateSpreadFilterLabels();
+    }
+
+    function updateSpreadFilterLabels() {
+        if (spreadFilterDiv) {
+            const btns = spreadFilterDiv.querySelectorAll('button');
+            if (btns.length >= 3) {
+                btns[1].textContent = spreadPlayer1Name || 'J1';
+                btns[2].textContent = spreadPlayer2Name || 'J2';
+            }
+        }
+    }
+
+    async function extractSpreadOddsFromMatch() {
+        try {
+
+            const heading = await waitForXPath("//div[contains(text(),'Écart de jeux')]");
+            if (!heading) throw new Error("Heading 'Écart de jeux' not found");
+
+            let sectionContainer = null;
+            let node = heading.parentNode;
+            while (node && node !== document.body) {
+                const hasOdds = document.evaluate(".//div[starts-with(@data-testid, 'odd-button-')]", node, null, XPathResult.BOOLEAN_TYPE, null).booleanValue;
+                if (hasOdds) { sectionContainer = node; break; }
+                node = node.parentNode;
+            }
+            if (!sectionContainer) throw new Error("Section container not found");
+
+            // Try to toggle to list view if needed
+            let currentOdds = xpathNodes(".//div[starts-with(@data-testid, 'odd-button-')]", sectionContainer);
+            if (currentOdds.length <= 2) {
+                const possibleToggles = xpathNodes(".//*[local-name()='svg' and .//*[local-name()='rect']]/parent::*", sectionContainer);
+                let toggleClicked = false;
+                for (let toggle of possibleToggles) {
+                    if (toggle.click && toggle.innerText === '') {
+                        toggle.click();
+                        await sleep(500);
+                        toggleClicked = true;
+                        break;
+                    }
+                }
+                if (!toggleClicked) {
+                    const fallbackToggle = document.evaluate(".//*[contains(@class, 'hukOGC')]", sectionContainer, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                    if (fallbackToggle && fallbackToggle.click) {
+                        fallbackToggle.click();
+                        await sleep(500);
+                    }
+                }
+            }
+
+            // Expand "Plus de sélections"
+            let previousCount = 0;
+            for (let i = 0; i < 10; i++) {
+                const expandBtn = document.evaluate(
+                    ".//div[contains(text(),'Plus de sélections')]/ancestor::div[contains(@class, 'expand-button') or contains(@class, 'expand')] | .//div[contains(text(),'Plus de sélections')]/..",
+                    sectionContainer, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
+                ).singleNodeValue;
+                if (!expandBtn) break;
+                if (expandBtn.innerText.trim().includes("Plus de sélections")) {
+                    expandBtn.click();
+                    await sleep(400);
+                    const newOdds = xpathNodes(".//div[starts-with(@data-testid, 'odd-button-')]", sectionContainer);
+                    if (newOdds.length === previousCount) break;
+                    previousCount = newOdds.length;
+                } else break;
+            }
+
+            const oddsButtons = xpathNodes(".//div[starts-with(@data-testid, 'odd-button-')]", sectionContainer);
+            if (oddsButtons.length === 0) throw new Error("No odds buttons found");
+
+            const oddsList = [];
+            for (const btn of oddsButtons) {
+                const valueSpan = document.evaluate(".//span[contains(@class, 'odd-button-value')]", btn, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                if (!valueSpan) continue;
+                let oddValue = valueSpan.textContent.trim();
+                const valueContainer = valueSpan.parentElement;
+                const nameDiv = valueContainer.previousElementSibling;
+                let name = nameDiv ? nameDiv.textContent.trim() : '';
+                if (!name) {
+                    const possibleNameDiv = document.evaluate(".//div[contains(text(),'+') or contains(text(),'-')]", btn, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                    if (possibleNameDiv) name = possibleNameDiv.textContent.trim();
+                }
+                if (name && oddValue) oddsList.push({ name, value: oddValue });
+            }
+
+            if (oddsList.length === 0) throw new Error("No odds extracted");
+
+            // Detect player names from odds (text before +/- sign)
+            const uniquePlayers = new Set();
+            for (const o of oddsList) {
+                const match = o.name.match(/^(.+?)\s[+-]/);
+                if (match) uniquePlayers.add(match[1].trim());
+            }
+            const playerNamesArray = Array.from(uniquePlayers).sort();
+            if (playerNamesArray.length >= 2) {
+                spreadPlayer1Name = playerNamesArray[0];
+                spreadPlayer2Name = playerNamesArray[1];
+            } else if (playerNamesArray.length === 1) {
+                spreadPlayer1Name = playerNamesArray[0];
+            }
+            updateSpreadFilterLabels();
+
+            // Apply player filter
+            let filteredOdds = oddsList;
+            if (spreadFilter === 'player1' && spreadPlayer1Name) {
+                filteredOdds = oddsList.filter(o => o.name.includes(spreadPlayer1Name));
+            } else if (spreadFilter === 'player2' && spreadPlayer2Name) {
+                filteredOdds = oddsList.filter(o => o.name.includes(spreadPlayer2Name));
+            }
+
+            // Group by handicap absolute value and sort
+            const grouped = {};
+            for (const o of filteredOdds) {
+                const match = o.name.match(/([+-]\d+(?:[.,]\d+)?)/);
+                const key = match ? match[1] : o.name;
+                if (!grouped[key]) grouped[key] = [];
+                grouped[key].push(o);
+            }
+
+            // Sort handicap keys numerically
+            const sortedKeys = Object.keys(grouped).sort((a, b) => {
+                const numA = parseFloat(a.replace(',', '.'));
+                const numB = parseFloat(b.replace(',', '.'));
+                return numA - numB;
+            });
+
+            const formattedOdds = [];
+            for (const key of sortedKeys) {
+                const items = grouped[key];
+                // Each handicap group has 2 items (one per player)
+                formattedOdds.push(items.map(o => `${o.name} : ${o.value}`).join(' | '));
+            }
+
+            lastExtractedData = formattedOdds.join('\n');
+            GM_setClipboard(lastExtractedData, 'text');
+            showProgress(`✅ ${filteredOdds.length} odds copied!`);
+        } catch (err) {
+            console.error(err);
+            showProgress(`❌ Error: ${err.message}`, true);
         }
     }
 
@@ -276,27 +489,53 @@
         const todayMatches = new Map();
         const allSeen = new Map();
         const scrollable = findScrollableContainer();
-        let crossedToTomorrow = false;
-        let lastTimeMinutes = -1;
+        const NIGHT_GAP_THRESHOLD = 360; // 6 hours in minutes
+        let stoppedByNightGap = false;
+        let lastRawMinutes = -1;
+        let lastNormalized = -1;
+        let dayOffset = 0;
+
+        function shouldKeepMatch(m) {
+            const raw = timeToMinutes(m.matchTime);
+            let normalized = raw;
+
+            if (lastRawMinutes === -1) {
+                // First match — initialise
+                lastRawMinutes = raw;
+                lastNormalized = raw;
+                return true;
+            }
+
+            // Handle midnight wrap: if clock goes backwards, add 24h
+            if (raw < lastRawMinutes) {
+                dayOffset += 1440;
+            }
+            normalized = raw + dayOffset;
+
+            const gap = normalized - lastNormalized;
+            if (gap > NIGHT_GAP_THRESHOLD) {
+                stoppedByNightGap = true;
+                return false; // This match is the first of the next session
+            }
+
+            lastRawMinutes = raw;
+            lastNormalized = normalized;
+            return true;
+        }
 
         // Process initial visible matches
         let initialMatches = extractCurrentMatches();
         for (let m of initialMatches) {
             const key = `${m.player1}|${m.player2}|${m.tournament}|${m.round}`;
             allSeen.set(key, m);
-            if (crossedToTomorrow) continue;
-            const mins = timeToMinutes(m.matchTime);
-            if (lastTimeMinutes !== -1 && mins < lastTimeMinutes) {
-                crossedToTomorrow = true;
-                continue;
+            if (stoppedByNightGap) continue;
+            if (shouldKeepMatch(m)) {
+                todayMatches.set(key, m);
             }
-            lastTimeMinutes = mins;
-            todayMatches.set(key, m);
         }
         if (onProgress) onProgress(todayMatches.size);
 
-        if (crossedToTomorrow) {
-            if (scrollable === window) window.scrollTo(0, window.scrollY);
+        if (stoppedByNightGap) {
             return Array.from(todayMatches.values());
         }
 
@@ -304,7 +543,7 @@
         const MAX_NO_NEW = 8;
         const originalScrollTop = (scrollable === window) ? window.scrollY : scrollable.scrollTop;
 
-        while (noNewCount < MAX_NO_NEW && !crossedToTomorrow) {
+        while (noNewCount < MAX_NO_NEW && !stoppedByNightGap) {
             let oldScrollTop = (scrollable === window) ? window.scrollY : scrollable.scrollTop;
             if (scrollable === window) window.scrollBy(0, 1000);
             else scrollable.scrollBy({ top: 1000, behavior: 'auto' });
@@ -320,16 +559,13 @@
                 const key = `${m.player1}|${m.player2}|${m.tournament}|${m.round}`;
                 if (allSeen.has(key)) continue;
                 allSeen.set(key, m);
-                if (crossedToTomorrow) continue;
 
-                const mins = timeToMinutes(m.matchTime);
-                if (lastTimeMinutes !== -1 && mins < lastTimeMinutes) {
-                    crossedToTomorrow = true;
-                    continue;
+                if (stoppedByNightGap) continue;
+
+                if (shouldKeepMatch(m)) {
+                    todayMatches.set(key, m);
+                    added++;
                 }
-                lastTimeMinutes = mins;
-                todayMatches.set(key, m);
-                added++;
             }
             if (added === 0) noNewCount++;
             else noNewCount = 0;
@@ -359,8 +595,6 @@
         actionBtn.style.cursor = 'wait';
         const originalText = actionBtn.textContent;
         actionBtn.textContent = '⏳ Scanning...';
-        if (copyBtn) copyBtn.style.display = 'none';
-        showProgress('🔍 Scanning for upcoming tennis matches...');
 
         try {
             extractedMatches = await extractAllMatchesFromSports((count) => {
@@ -377,20 +611,13 @@
             }
 
             const formatted = formatMatches(extractedMatches);
-            let copySuccess = false;
             try {
                 await navigator.clipboard.writeText(formatted);
-                copySuccess = true;
             } catch (err) {
-                try { GM_setClipboard(formatted, 'text'); copySuccess = true; } catch(e) { console.error(e); }
+                try { GM_setClipboard(formatted, 'text'); } catch(e) { console.error(e); }
             }
 
-            if (copySuccess) {
-                showProgress(`✅ Found ${extractedMatches.length} match${extractedMatches.length > 1 ? 'es' : ''}. Copied to clipboard!`);
-            } else {
-                showProgress(`✅ Found ${extractedMatches.length} match${extractedMatches.length > 1 ? 'es' : ''}. Copy failed, use button below.`, true);
-            }
-            if (copyBtn) copyBtn.style.display = 'block';
+            showProgress(`✅ Found ${extractedMatches.length} match${extractedMatches.length > 1 ? 'es' : ''}. Copied to clipboard!`);
         } catch (err) {
             showProgress('❌ Error: ' + err.message, true);
             console.error(err);
@@ -404,29 +631,24 @@
         }
     }
 
-    async function handleSportsCopy() {
-        if (!extractedMatches.length) return;
-        const formatted = formatMatches(extractedMatches);
-        try {
-            await navigator.clipboard.writeText(formatted);
-            showProgress(`📋 Copied ${extractedMatches.length} match${extractedMatches.length > 1 ? 'es' : ''}!`);
-        } catch (err) {
-            try { GM_setClipboard(formatted, 'text'); showProgress(`📋 Copied ${extractedMatches.length} match${extractedMatches.length > 1 ? 'es' : ''}!`); }
-            catch(e) { showProgress('❌ Copy failed.', true); console.log(formatted); }
-        }
-    }
-
     // --- UI Creation / Destruction --------------------------------------
     function removeUI() {
         if (uiContainer && uiContainer.parentNode) uiContainer.parentNode.removeChild(uiContainer);
         uiContainer = null;
         progressDiv = null;
         actionBtn = null;
-        copyBtn = null;
+        modeSelectorDiv = null;
+        sectionSelectorDiv = null;
+        spreadFilterDiv = null;
         if (progressTimeout) clearTimeout(progressTimeout);
         currentMode = null;
         lastExtractedData = '';
         extractedMatches = [];
+        oddsMode = 'all';
+        sectionType = 'nombre-de-jeux';
+        spreadFilter = 'all';
+        spreadPlayer1Name = '';
+        spreadPlayer2Name = '';
     }
 
     function createBaseUI() {
@@ -473,7 +695,8 @@
             color: white;
             font-size: 14px;
             font-weight: 600;
-            padding: 10px 24px;
+            padding: 10px 36px;
+            min-width: 220px;
             border-radius: 40px;
             cursor: pointer;
             box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
@@ -491,59 +714,270 @@
             actionBtn.style.boxShadow = '0 4px 12px rgba(0, 0, 0, 0.25)';
         });
 
-        copyBtn = document.createElement('button');
-        copyBtn.textContent = '📋 Copy';
-        copyBtn.style.cssText = `
-            background: linear-gradient(135deg, #2c9e5c, #1e6b3e);
-            border: none;
-            color: white;
-            font-size: 14px;
-            font-weight: 600;
-            padding: 10px 24px;
-            border-radius: 40px;
-            cursor: pointer;
-            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
-            transition: all 0.2s cubic-bezier(0.2, 0.9, 0.4, 1.1);
-            letter-spacing: 0.5px;
-            backdrop-filter: blur(4px);
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            display: none;
-        `;
-        copyBtn.addEventListener('mouseenter', () => {
-            copyBtn.style.transform = 'translateY(-2px) scale(1.02)';
-            copyBtn.style.boxShadow = '0 8px 20px rgba(0, 0, 0, 0.3)';
-        });
-        copyBtn.addEventListener('mouseleave', () => {
-            copyBtn.style.transform = 'translateY(0) scale(1)';
-            copyBtn.style.boxShadow = '0 4px 12px rgba(0, 0, 0, 0.25)';
-        });
-
         uiContainer.appendChild(progressDiv);
         uiContainer.appendChild(actionBtn);
-        uiContainer.appendChild(copyBtn);
         document.body.appendChild(uiContainer);
+    }
+
+    function createModeSelector() {
+        if (modeSelectorDiv) modeSelectorDiv.remove();
+
+        modeSelectorDiv = document.createElement('div');
+        modeSelectorDiv.style.cssText = `
+            display: flex;
+            gap: 4px;
+            justify-content: center;
+        `;
+
+        const modes = [
+            { key: 'all', label: 'All' },
+            { key: 'over', label: 'Over' },
+            { key: 'under', label: 'Under' },
+        ];
+
+        const updateModeBtns = () => {
+            modeBtns.forEach(btn => {
+                const isActive = btn.dataset.mode === oddsMode;
+                btn.style.background = isActive
+                    ? 'linear-gradient(135deg, #1e6df2, #0a4bc2)'
+                    : 'rgba(255, 255, 255, 0.15)';
+                btn.style.color = isActive ? 'white' : 'rgba(255, 255, 255, 0.7)';
+                btn.style.borderColor = isActive ? 'rgba(255,255,255,0.4)' : 'rgba(255,255,255,0.15)';
+                btn.style.fontWeight = isActive ? '700' : '500';
+            });
+        };
+
+        const modeBtns = [];
+        for (const m of modes) {
+            const btn = document.createElement('button');
+            btn.textContent = m.label;
+            btn.dataset.mode = m.key;
+            btn.style.cssText = `
+                background: rgba(255, 255, 255, 0.15);
+                border: 1px solid rgba(255, 255, 255, 0.15);
+                color: rgba(255, 255, 255, 0.7);
+                font-size: 11px;
+                font-weight: 500;
+                padding: 4px 14px;
+                min-width: 60px;
+                border-radius: 20px;
+                cursor: pointer;
+                transition: all 0.2s ease;
+                font-family: inherit;
+                letter-spacing: 0.3px;
+            `;
+            btn.addEventListener('mouseenter', () => {
+                if (btn.dataset.mode !== oddsMode) {
+                    btn.style.background = 'rgba(255, 255, 255, 0.25)';
+                }
+            });
+            btn.addEventListener('mouseleave', () => {
+                if (btn.dataset.mode !== oddsMode) {
+                    btn.style.background = 'rgba(255, 255, 255, 0.15)';
+                }
+            });
+            btn.addEventListener('click', () => {
+                oddsMode = btn.dataset.mode;
+                updateModeBtns();
+            });
+            modeBtns.push(btn);
+            modeSelectorDiv.appendChild(btn);
+        }
+
+        updateModeBtns();
+        // Insert mode selector after section selector
+        if (sectionSelectorDiv && sectionSelectorDiv.parentNode) {
+            sectionSelectorDiv.after(modeSelectorDiv);
+        } else {
+            uiContainer.insertBefore(modeSelectorDiv, actionBtn);
+        }
+    }
+
+    function createSpreadFilterSelector() {
+        if (spreadFilterDiv) spreadFilterDiv.remove();
+
+        spreadFilterDiv = document.createElement('div');
+        spreadFilterDiv.style.cssText = `
+            display: flex;
+            gap: 4px;
+            justify-content: center;
+        `;
+
+        const updateFilterBtns = () => {
+            filterBtns.forEach(btn => {
+                const isActive = btn.dataset.filter === spreadFilter;
+                btn.style.background = isActive
+                    ? 'linear-gradient(135deg, #1e6df2, #0a4bc2)'
+                    : 'rgba(255, 255, 255, 0.15)';
+                btn.style.color = isActive ? 'white' : 'rgba(255, 255, 255, 0.7)';
+                btn.style.borderColor = isActive ? 'rgba(255,255,255,0.4)' : 'rgba(255,255,255,0.15)';
+                btn.style.fontWeight = isActive ? '700' : '500';
+            });
+            // Update button labels with player names if available
+            if (filterBtns.length >= 3) {
+                filterBtns[1].textContent = spreadPlayer1Name || 'J1';
+                filterBtns[2].textContent = spreadPlayer2Name || 'J2';
+            }
+        };
+
+        const filterBtns = [];
+        const filters = [
+            { key: 'all', label: 'All' },
+            { key: 'player1', label: spreadPlayer1Name || 'J1' },
+            { key: 'player2', label: spreadPlayer2Name || 'J2' },
+        ];
+
+        for (const f of filters) {
+            const btn = document.createElement('button');
+            btn.textContent = f.label;
+            btn.dataset.filter = f.key;
+            btn.style.cssText = `
+                background: rgba(255, 255, 255, 0.15);
+                border: 1px solid rgba(255, 255, 255, 0.15);
+                color: rgba(255, 255, 255, 0.7);
+                font-size: 11px;
+                font-weight: 500;
+                padding: 4px 14px;
+                min-width: 60px;
+                border-radius: 20px;
+                cursor: pointer;
+                transition: all 0.2s ease;
+                font-family: inherit;
+                letter-spacing: 0.3px;
+            `;
+            btn.addEventListener('mouseenter', () => {
+                if (btn.dataset.filter !== spreadFilter) {
+                    btn.style.background = 'rgba(255, 255, 255, 0.25)';
+                }
+            });
+            btn.addEventListener('mouseleave', () => {
+                if (btn.dataset.filter !== spreadFilter) {
+                    btn.style.background = 'rgba(255, 255, 255, 0.15)';
+                }
+            });
+            btn.addEventListener('click', () => {
+                spreadFilter = btn.dataset.filter;
+                updateFilterBtns();
+            });
+            filterBtns.push(btn);
+            spreadFilterDiv.appendChild(btn);
+        }
+
+        updateFilterBtns();
+        // Insert spread filter after mode selector (same slot, one visible at a time)
+        if (modeSelectorDiv && modeSelectorDiv.parentNode) {
+            modeSelectorDiv.after(spreadFilterDiv);
+        } else {
+            uiContainer.insertBefore(spreadFilterDiv, actionBtn);
+        }
+        // Initially hidden (only shown when Écart Jeux is selected)
+        spreadFilterDiv.style.display = 'none';
+    }
+
+    function createSectionSelector() {
+        if (sectionSelectorDiv) sectionSelectorDiv.remove();
+
+        sectionSelectorDiv = document.createElement('div');
+        sectionSelectorDiv.style.cssText = `
+            display: flex;
+            gap: 4px;
+            justify-content: center;
+        `;
+
+        const sections = [
+            { key: 'Total Games', label: 'Total Games' },
+            { key: 'Games Spread', label: 'Games Spread' },
+        ];
+
+        const updateSectionBtns = () => {
+            sectionBtns.forEach(btn => {
+                const isActive = btn.dataset.section === sectionType;
+                btn.style.background = isActive
+                    ? 'linear-gradient(135deg, #1e6df2, #0a4bc2)'
+                    : 'rgba(255, 255, 255, 0.15)';
+                btn.style.color = isActive ? 'white' : 'rgba(255, 255, 255, 0.7)';
+                btn.style.borderColor = isActive ? 'rgba(255,255,255,0.4)' : 'rgba(255,255,255,0.15)';
+                btn.style.fontWeight = isActive ? '700' : '500';
+            });
+            // Show/hide mode and spread filter selectors based on section
+            if (modeSelectorDiv) {
+                modeSelectorDiv.style.display = sectionType === 'Total Games' ? 'flex' : 'none';
+            }
+            if (spreadFilterDiv) {
+                spreadFilterDiv.style.display = sectionType === 'Games Spread' ? 'flex' : 'none';
+            }
+        };
+
+        const sectionBtns = [];
+        for (const s of sections) {
+            const btn = document.createElement('button');
+            btn.textContent = s.label;
+            btn.dataset.section = s.key;
+            btn.style.cssText = `
+                background: rgba(255, 255, 255, 0.15);
+                border: 1px solid rgba(255, 255, 255, 0.15);
+                color: rgba(255, 255, 255, 0.7);
+                font-size: 11px;
+                font-weight: 500;
+                padding: 4px 14px;
+                min-width: 80px;
+                border-radius: 20px;
+                cursor: pointer;
+                transition: all 0.2s ease;
+                font-family: inherit;
+                letter-spacing: 0.3px;
+            `;
+            btn.addEventListener('mouseenter', () => {
+                if (btn.dataset.section !== sectionType) {
+                    btn.style.background = 'rgba(255, 255, 255, 0.25)';
+                }
+            });
+            btn.addEventListener('mouseleave', () => {
+                if (btn.dataset.section !== sectionType) {
+                    btn.style.background = 'rgba(255, 255, 255, 0.15)';
+                }
+            });
+            btn.addEventListener('click', () => {
+                sectionType = btn.dataset.section;
+                updateSectionBtns();
+                // Update action button text
+                if (actionBtn) {
+                    actionBtn.textContent = sectionType === 'Total Games' ? '🎾 Extract odds' : '🎾 Extract odds';
+                }
+                // Detect player names when switching to Games Spread
+                if (sectionType === 'Games Spread') {
+                    detectSpreadPlayerNames();
+                }
+            });
+            sectionBtns.push(btn);
+            sectionSelectorDiv.appendChild(btn);
+        }
+
+        updateSectionBtns();
+        // Insert section selector before actionBtn (first in the options row)
+        uiContainer.insertBefore(sectionSelectorDiv, actionBtn);
     }
 
     function createMatchUI() {
         createBaseUI();
+        createSectionSelector();
+        createModeSelector();
+        createSpreadFilterSelector();
+        // Pre-populate player names from the DOM if available
+        detectSpreadPlayerNames();
         actionBtn.textContent = '🎾 Extract odds';
         actionBtn.onclick = async () => {
             if (actionBtn.disabled) return;
             actionBtn.disabled = true;
-            copyBtn.style.display = 'none';
             const originalText = actionBtn.textContent;
             actionBtn.textContent = '⏳ Extracting...';
-            await extractOddsFromMatch();
+            if (sectionType === 'Total Games') {
+                await extractOddsFromMatch();
+            } else {
+                await extractSpreadOddsFromMatch();
+            }
             actionBtn.disabled = false;
             actionBtn.textContent = originalText;
-        };
-        copyBtn.onclick = () => {
-            if (lastExtractedData) {
-                GM_setClipboard(lastExtractedData, 'text');
-                showProgress("📋 Odds copied!");
-            } else {
-                showProgress("⚠️ No data to copy", true);
-            }
         };
         currentMode = 'match';
     }
@@ -552,7 +986,6 @@
         createBaseUI();
         actionBtn.textContent = '🎾 Extract Matches';
         actionBtn.onclick = () => handleSportsExtract();
-        copyBtn.onclick = () => handleSportsCopy();
         currentMode = 'sports';
     }
 
