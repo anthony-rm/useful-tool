@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Winamax Tennis Tools
 // @namespace    http://tampermonkey.net/
-// @version      4.0
+// @version      5.0
 // @description  Extracts "Number of Games" & "Game Spread" odds from tennis match pages OR upcoming singles matches from the tennis sports page. Features dynamic UI, clipboard copy, dark/light theme, and scroll scanning.
 // @match        https://www.winamax.fr/*
 // @updateURL    https://raw.githubusercontent.com/anthony-rm/useful-tool/main/script.js
@@ -14,6 +14,26 @@
 
     // --- Shared helpers -------------------------------------------------
     function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+    // Cross-browser clipboard copy (compatible with Safari Userscripts, Tampermonkey, etc.)
+    async function copyToClipboard(text) {
+        try {
+            // Try standard Web API first (works in Safari, modern browsers)
+            await navigator.clipboard.writeText(text);
+            return true;
+        } catch (err) {
+            // Fallback to GM_setClipboard for Tampermonkey/other extensions
+            try {
+                if (typeof GM_setClipboard !== 'undefined') {
+                    GM_setClipboard(text, 'text');
+                    return true;
+                }
+            } catch (gmErr) {
+                console.error('Clipboard failed:', gmErr);
+            }
+            return false;
+        }
+    }
 
     // Evaluate XPath and return array of nodes
     function xpathNodes(xpath, context = document) {
@@ -188,7 +208,7 @@
             }
 
             lastExtractedData = formattedOdds.join('\n');
-            GM_setClipboard(lastExtractedData, 'text');
+            await copyToClipboard(lastExtractedData);
             showProgress(`✅ ${formattedOdds.length} odds copied!`);
         } catch (err) {
             console.error(err);
@@ -374,7 +394,7 @@
             }
 
             lastExtractedData = formattedOdds.join('\n');
-            GM_setClipboard(lastExtractedData, 'text');
+            await copyToClipboard(lastExtractedData);
             showProgress(`✅ ${filteredOdds.length} odds copied!`);
         } catch (err) {
             console.error(err);
@@ -611,11 +631,7 @@
             }
 
             const formatted = formatMatches(extractedMatches);
-            try {
-                await navigator.clipboard.writeText(formatted);
-            } catch (err) {
-                try { GM_setClipboard(formatted, 'text'); } catch(e) { console.error(e); }
-            }
+            await copyToClipboard(formatted);
 
             showProgress(`✅ Found ${extractedMatches.length} match${extractedMatches.length > 1 ? 'es' : ''}. Copied to clipboard!`);
         } catch (err) {
