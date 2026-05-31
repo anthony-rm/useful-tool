@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Winamax Tennis Tools
 // @namespace    http://tampermonkey.net/
-// @version      5.0
+// @version      7.0
 // @description  Extracts "Number of Games" & "Game Spread" odds from tennis match pages OR upcoming singles matches from the tennis sports page. Features dynamic UI, clipboard copy, dark/light theme, and scroll scanning.
 // @match        https://www.winamax.fr/*
 // @updateURL    https://raw.githubusercontent.com/anthony-rm/useful-tool/main/script.js
@@ -77,12 +77,15 @@
     let extractedMatches = [];     // for sports mode
     let oddsMode = 'all';          // 'all', 'over', 'under' for match mode
     let modeSelectorDiv = null;    // mode toggle UI container
-    let sectionType = 'nombre-de-jeux'; // 'nombre-de-jeux' or 'ecart-de-jeux'
+    let sectionType = 'Total Games'; // 'Total Games' or 'Games Spread'
     let sectionSelectorDiv = null;     // section toggle UI container
     let spreadFilter = 'all';          // 'all', 'player1', 'player2' for spread mode
     let spreadFilterDiv = null;        // spread filter UI container
     let spreadPlayer1Name = '';        // detected player 1 name
     let spreadPlayer2Name = '';        // detected player 2 name
+    let modeBtns = [];                 // store mode button references
+    let sectionBtns = [];              // store section button references
+    let filterBtns = [];               // store filter button references
 
     // --- Theming --------------------------------------------------------
     function updateProgressTheme() {
@@ -106,6 +109,50 @@
         progressTimeout = setTimeout(() => {
             if (progressDiv && progressDiv.style.display === 'block') progressDiv.style.display = 'none';
         }, 3000);
+    }
+
+    // Global button update function
+    function updateAllButtons() {
+        // Update mode buttons
+        modeBtns.forEach(btn => {
+            const isActive = btn.dataset.mode === oddsMode;
+            btn.style.background = isActive ? 'linear-gradient(135deg, #1e6df2, #0a4bc2)' : 'rgba(255, 255, 255, 0.15)';
+            btn.style.color = isActive ? 'white' : 'rgba(255, 255, 255, 0.7)';
+            btn.style.borderColor = isActive ? 'rgba(255,255,255,0.4)' : 'rgba(255,255,255,0.15)';
+            btn.style.fontWeight = isActive ? '700' : '500';
+        });
+        
+        // Update section buttons
+        sectionBtns.forEach(btn => {
+            const isActive = btn.dataset.section === sectionType;
+            btn.style.background = isActive ? 'linear-gradient(135deg, #1e6df2, #0a4bc2)' : 'rgba(255, 255, 255, 0.15)';
+            btn.style.color = isActive ? 'white' : 'rgba(255, 255, 255, 0.7)';
+            btn.style.borderColor = isActive ? 'rgba(255,255,255,0.4)' : 'rgba(255,255,255,0.15)';
+            btn.style.fontWeight = isActive ? '700' : '500';
+        });
+        
+        // Update filter buttons
+        filterBtns.forEach(btn => {
+            const isActive = btn.dataset.filter === spreadFilter;
+            btn.style.background = isActive ? 'linear-gradient(135deg, #1e6df2, #0a4bc2)' : 'rgba(255, 255, 255, 0.15)';
+            btn.style.color = isActive ? 'white' : 'rgba(255, 255, 255, 0.7)';
+            btn.style.borderColor = isActive ? 'rgba(255,255,255,0.4)' : 'rgba(255,255,255,0.15)';
+            btn.style.fontWeight = isActive ? '700' : '500';
+        });
+        
+        // Update filter button labels with player names
+        if (filterBtns.length >= 3) {
+            filterBtns[1].textContent = spreadPlayer1Name || 'J1';
+            filterBtns[2].textContent = spreadPlayer2Name || 'J2';
+        }
+        
+        // Show/hide mode and spread filter selectors based on section
+        if (modeSelectorDiv) {
+            modeSelectorDiv.style.display = sectionType === 'Total Games' ? 'flex' : 'none';
+        }
+        if (spreadFilterDiv) {
+            spreadFilterDiv.style.display = sectionType === 'Games Spread' ? 'flex' : 'none';
+        }
     }
 
     // --- Match page extraction (Nombre de jeux odds) --------------------
@@ -661,7 +708,7 @@
         lastExtractedData = '';
         extractedMatches = [];
         oddsMode = 'all';
-        sectionType = 'nombre-de-jeux';
+        sectionType = 'Total Games';
         spreadFilter = 'all';
         spreadPlayer1Name = '';
         spreadPlayer2Name = '';
@@ -751,19 +798,7 @@
             { key: 'under', label: 'Under' },
         ];
 
-        const updateModeBtns = () => {
-            modeBtns.forEach(btn => {
-                const isActive = btn.dataset.mode === oddsMode;
-                btn.style.background = isActive
-                    ? 'linear-gradient(135deg, #1e6df2, #0a4bc2)'
-                    : 'rgba(255, 255, 255, 0.15)';
-                btn.style.color = isActive ? 'white' : 'rgba(255, 255, 255, 0.7)';
-                btn.style.borderColor = isActive ? 'rgba(255,255,255,0.4)' : 'rgba(255,255,255,0.15)';
-                btn.style.fontWeight = isActive ? '700' : '500';
-            });
-        };
-
-        const modeBtns = [];
+        modeBtns = [];
         for (const m of modes) {
             const btn = document.createElement('button');
             btn.textContent = m.label;
@@ -794,13 +829,13 @@
             });
             btn.addEventListener('click', () => {
                 oddsMode = btn.dataset.mode;
-                updateModeBtns();
+                updateAllButtons();
             });
             modeBtns.push(btn);
             modeSelectorDiv.appendChild(btn);
         }
 
-        updateModeBtns();
+        updateAllButtons();
         // Insert mode selector after section selector
         if (sectionSelectorDiv && sectionSelectorDiv.parentNode) {
             sectionSelectorDiv.after(modeSelectorDiv);
@@ -819,30 +854,13 @@
             justify-content: center;
         `;
 
-        const updateFilterBtns = () => {
-            filterBtns.forEach(btn => {
-                const isActive = btn.dataset.filter === spreadFilter;
-                btn.style.background = isActive
-                    ? 'linear-gradient(135deg, #1e6df2, #0a4bc2)'
-                    : 'rgba(255, 255, 255, 0.15)';
-                btn.style.color = isActive ? 'white' : 'rgba(255, 255, 255, 0.7)';
-                btn.style.borderColor = isActive ? 'rgba(255,255,255,0.4)' : 'rgba(255,255,255,0.15)';
-                btn.style.fontWeight = isActive ? '700' : '500';
-            });
-            // Update button labels with player names if available
-            if (filterBtns.length >= 3) {
-                filterBtns[1].textContent = spreadPlayer1Name || 'J1';
-                filterBtns[2].textContent = spreadPlayer2Name || 'J2';
-            }
-        };
-
-        const filterBtns = [];
         const filters = [
             { key: 'all', label: 'All' },
             { key: 'player1', label: spreadPlayer1Name || 'J1' },
             { key: 'player2', label: spreadPlayer2Name || 'J2' },
         ];
 
+        filterBtns = [];
         for (const f of filters) {
             const btn = document.createElement('button');
             btn.textContent = f.label;
@@ -873,13 +891,13 @@
             });
             btn.addEventListener('click', () => {
                 spreadFilter = btn.dataset.filter;
-                updateFilterBtns();
+                updateAllButtons();
             });
             filterBtns.push(btn);
             spreadFilterDiv.appendChild(btn);
         }
 
-        updateFilterBtns();
+        updateAllButtons();
         // Insert spread filter after mode selector (same slot, one visible at a time)
         if (modeSelectorDiv && modeSelectorDiv.parentNode) {
             modeSelectorDiv.after(spreadFilterDiv);
@@ -905,26 +923,7 @@
             { key: 'Games Spread', label: 'Games Spread' },
         ];
 
-        const updateSectionBtns = () => {
-            sectionBtns.forEach(btn => {
-                const isActive = btn.dataset.section === sectionType;
-                btn.style.background = isActive
-                    ? 'linear-gradient(135deg, #1e6df2, #0a4bc2)'
-                    : 'rgba(255, 255, 255, 0.15)';
-                btn.style.color = isActive ? 'white' : 'rgba(255, 255, 255, 0.7)';
-                btn.style.borderColor = isActive ? 'rgba(255,255,255,0.4)' : 'rgba(255,255,255,0.15)';
-                btn.style.fontWeight = isActive ? '700' : '500';
-            });
-            // Show/hide mode and spread filter selectors based on section
-            if (modeSelectorDiv) {
-                modeSelectorDiv.style.display = sectionType === 'Total Games' ? 'flex' : 'none';
-            }
-            if (spreadFilterDiv) {
-                spreadFilterDiv.style.display = sectionType === 'Games Spread' ? 'flex' : 'none';
-            }
-        };
-
-        const sectionBtns = [];
+        sectionBtns = [];
         for (const s of sections) {
             const btn = document.createElement('button');
             btn.textContent = s.label;
@@ -955,21 +954,21 @@
             });
             btn.addEventListener('click', () => {
                 sectionType = btn.dataset.section;
-                updateSectionBtns();
+                updateAllButtons();
                 // Update action button text
                 if (actionBtn) {
                     actionBtn.textContent = sectionType === 'Total Games' ? '🎾 Extract odds' : '🎾 Extract odds';
                 }
-                // Detect player names when switching to Games Spread
+                // Detect player names when switching to Games Spread (deferred to avoid blocking UI)
                 if (sectionType === 'Games Spread') {
-                    detectSpreadPlayerNames();
+                    setTimeout(() => detectSpreadPlayerNames(), 0);
                 }
             });
             sectionBtns.push(btn);
             sectionSelectorDiv.appendChild(btn);
         }
 
-        updateSectionBtns();
+        updateAllButtons();
         // Insert section selector before actionBtn (first in the options row)
         uiContainer.insertBefore(sectionSelectorDiv, actionBtn);
     }
