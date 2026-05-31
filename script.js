@@ -174,7 +174,7 @@
             const formatOdd = (o) => {
                 const label = o.name.includes('Plus de') ? 'Over' : 'Under';
                 const threshold = o.name.replace('Plus de ', '').replace('Moins de ', '');
-                return `${label} ${threshold} : ${o.value}`;
+                return `${label} ${threshold} jeux : ${o.value.replace(',', '.')}`;
             };
 
             // Build output based on selected mode
