@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Winamax Tennis Tools
 // @namespace    http://tampermonkey.net/
-// @version      7.0
+// @version      8.0
 // @description  Extracts "Number of Games" & "Game Spread" odds from tennis match pages OR upcoming singles matches from the tennis sports page. Features dynamic UI, clipboard copy, dark/light theme, and scroll scanning.
 // @match        https://www.winamax.fr/*
 // @updateURL    https://raw.githubusercontent.com/anthony-rm/useful-tool/main/script.js
@@ -86,6 +86,9 @@
     let modeBtns = [];                 // store mode button references
     let sectionBtns = [];              // store section button references
     let filterBtns = [];               // store filter button references
+    let sportsScanLimit = true;        // for sports mode (true = stop at night gap)
+    let sportsLimitSelectorDiv = null; // sports range toggle UI
+    let sportsLimitBtns = [];          // store sports limit button references
 
     // --- Theming --------------------------------------------------------
     function updateProgressTheme() {
@@ -134,6 +137,15 @@
         // Update filter buttons
         filterBtns.forEach(btn => {
             const isActive = btn.dataset.filter === spreadFilter;
+            btn.style.background = isActive ? 'linear-gradient(135deg, #1e6df2, #0a4bc2)' : 'rgba(255, 255, 255, 0.15)';
+            btn.style.color = isActive ? 'white' : 'rgba(255, 255, 255, 0.7)';
+            btn.style.borderColor = isActive ? 'rgba(255,255,255,0.4)' : 'rgba(255,255,255,0.15)';
+            btn.style.fontWeight = isActive ? '700' : '500';
+        });
+
+        // Update sports limit buttons
+        sportsLimitBtns.forEach(btn => {
+            const isActive = (btn.dataset.limit === 'true') === sportsScanLimit;
             btn.style.background = isActive ? 'linear-gradient(135deg, #1e6df2, #0a4bc2)' : 'rgba(255, 255, 255, 0.15)';
             btn.style.color = isActive ? 'white' : 'rgba(255, 255, 255, 0.7)';
             btn.style.borderColor = isActive ? 'rgba(255,255,255,0.4)' : 'rgba(255,255,255,0.15)';
@@ -580,7 +592,7 @@
             normalized = raw + dayOffset;
 
             const gap = normalized - lastNormalized;
-            if (gap > NIGHT_GAP_THRESHOLD) {
+            if (gap > NIGHT_GAP_THRESHOLD && sportsScanLimit) {
                 stoppedByNightGap = true;
                 return false; // This match is the first of the next session
             }
@@ -712,6 +724,9 @@
         spreadFilter = 'all';
         spreadPlayer1Name = '';
         spreadPlayer2Name = '';
+        sportsLimitSelectorDiv = null;
+        sportsLimitBtns = [];
+        sportsScanLimit = true;
     }
 
     function createBaseUI() {
@@ -908,6 +923,64 @@
         spreadFilterDiv.style.display = 'none';
     }
 
+    function createSportsLimitSelector() {
+        if (sportsLimitSelectorDiv) sportsLimitSelectorDiv.remove();
+
+        sportsLimitSelectorDiv = document.createElement('div');
+        sportsLimitSelectorDiv.style.cssText = `
+            display: flex;
+            gap: 4px;
+            justify-content: center;
+        `;
+
+        const limits = [
+            { key: 'true', label: 'Stop at Night Gap' },
+            { key: 'false', label: 'Extract All Page' },
+        ];
+
+        sportsLimitBtns = [];
+        for (const l of limits) {
+            const btn = document.createElement('button');
+            btn.textContent = l.label;
+            btn.dataset.limit = l.key;
+            btn.style.cssText = `
+                background: rgba(255, 255, 255, 0.15);
+                border: 1px solid rgba(255, 255, 255, 0.15);
+                color: rgba(255, 255, 255, 0.7);
+                font-size: 11px;
+                font-weight: 500;
+                padding: 4px 14px;
+                min-width: 100px;
+                border-radius: 20px;
+                cursor: pointer;
+                transition: all 0.2s ease;
+                font-family: inherit;
+                letter-spacing: 0.3px;
+            `;
+            btn.addEventListener('mouseenter', () => {
+                const isActive = (btn.dataset.limit === 'true') === sportsScanLimit;
+                if (!isActive) {
+                    btn.style.background = 'rgba(255, 255, 255, 0.25)';
+                }
+            });
+            btn.addEventListener('mouseleave', () => {
+                const isActive = (btn.dataset.limit === 'true') === sportsScanLimit;
+                if (!isActive) {
+                    btn.style.background = 'rgba(255, 255, 255, 0.15)';
+                }
+            });
+            btn.addEventListener('click', () => {
+                sportsScanLimit = btn.dataset.limit === 'true';
+                updateAllButtons();
+            });
+            sportsLimitBtns.push(btn);
+            sportsLimitSelectorDiv.appendChild(btn);
+        }
+
+        updateAllButtons();
+        uiContainer.insertBefore(sportsLimitSelectorDiv, actionBtn);
+    }
+
     function createSectionSelector() {
         if (sectionSelectorDiv) sectionSelectorDiv.remove();
 
@@ -957,7 +1030,7 @@
                 updateAllButtons();
                 // Update action button text
                 if (actionBtn) {
-                    actionBtn.textContent = sectionType === 'Total Games' ? '🎾 Extract odds' : '🎾 Extract odds';
+                    actionBtn.textContent = '🎾 Extract odds';
                 }
                 // Detect player names when switching to Games Spread (deferred to avoid blocking UI)
                 if (sectionType === 'Games Spread') {
@@ -999,6 +1072,7 @@
 
     function createSportsUI() {
         createBaseUI();
+        createSportsLimitSelector();
         actionBtn.textContent = '🎾 Extract Matches';
         actionBtn.onclick = () => handleSportsExtract();
         currentMode = 'sports';
