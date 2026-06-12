@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Winamax Tennis Tools
+// @name         Winamax Tennis & Volleyball Tools
 // @namespace    http://tampermonkey.net/
-// @version      8.0
-// @description  Extracts "Number of Games" & "Game Spread" odds from tennis match pages OR upcoming singles matches from the tennis sports page. Features dynamic UI, clipboard copy, dark/light theme, and scroll scanning.
+// @version      9.1
+// @description  Extracts betting odds from Winamax match pages. Tennis: "Number of Games" & "Game Spread" odds. Volleyball: ALL odds from all sections. Features dynamic UI, clipboard copy, dark/light theme.
 // @match        https://www.winamax.fr/*
 // @updateURL    https://raw.githubusercontent.com/anthony-rm/useful-tool/main/script.js
 // @downloadURL  https://raw.githubusercontent.com/anthony-rm/useful-tool/main/script.js
@@ -89,6 +89,9 @@
     let sportsScanLimit = true;        // for sports mode (true = stop at night gap)
     let sportsLimitSelectorDiv = null; // sports range toggle UI
     let sportsLimitBtns = [];          // store sports limit button references
+    let sportType = 'tennis';          // 'tennis' or 'volleyball' for match mode
+    let sportSelectDiv = null;         // sport selector UI container
+    let sportBtns = [];                // store sport button references
 
     // --- Theming --------------------------------------------------------
     function updateProgressTheme() {
@@ -124,7 +127,7 @@
             btn.style.borderColor = isActive ? 'rgba(255,255,255,0.4)' : 'rgba(255,255,255,0.15)';
             btn.style.fontWeight = isActive ? '700' : '500';
         });
-        
+
         // Update section buttons
         sectionBtns.forEach(btn => {
             const isActive = btn.dataset.section === sectionType;
@@ -133,7 +136,7 @@
             btn.style.borderColor = isActive ? 'rgba(255,255,255,0.4)' : 'rgba(255,255,255,0.15)';
             btn.style.fontWeight = isActive ? '700' : '500';
         });
-        
+
         // Update filter buttons
         filterBtns.forEach(btn => {
             const isActive = btn.dataset.filter === spreadFilter;
@@ -151,20 +154,27 @@
             btn.style.borderColor = isActive ? 'rgba(255,255,255,0.4)' : 'rgba(255,255,255,0.15)';
             btn.style.fontWeight = isActive ? '700' : '500';
         });
-        
+
+        // Update sport buttons
+        sportBtns.forEach(btn => {
+            const isActive = btn.dataset.sport === sportType;
+            btn.style.background = isActive ? 'linear-gradient(135deg, #1e6df2, #0a4bc2)' : 'rgba(255, 255, 255, 0.15)';
+            btn.style.color = isActive ? 'white' : 'rgba(255, 255, 255, 0.7)';
+            btn.style.borderColor = isActive ? 'rgba(255,255,255,0.4)' : 'rgba(255,255,255,0.15)';
+            btn.style.fontWeight = isActive ? '700' : '500';
+        });
+
         // Update filter button labels with player names
         if (filterBtns.length >= 3) {
             filterBtns[1].textContent = spreadPlayer1Name || 'J1';
             filterBtns[2].textContent = spreadPlayer2Name || 'J2';
         }
-        
-        // Show/hide mode and spread filter selectors based on section
-        if (modeSelectorDiv) {
-            modeSelectorDiv.style.display = sectionType === 'Total Games' ? 'flex' : 'none';
-        }
-        if (spreadFilterDiv) {
-            spreadFilterDiv.style.display = sectionType === 'Games Spread' ? 'flex' : 'none';
-        }
+
+        // Show/hide tennis-specific controls based on sport type
+        const isTennis = sportType === 'tennis';
+        if (sectionSelectorDiv) sectionSelectorDiv.style.display = isTennis ? 'flex' : 'none';
+        if (modeSelectorDiv) modeSelectorDiv.style.display = (isTennis && sectionType === 'Total Games') ? 'flex' : 'none';
+        if (spreadFilterDiv) spreadFilterDiv.style.display = (isTennis && sectionType === 'Games Spread') ? 'flex' : 'none';
     }
 
     // --- Match page extraction (Nombre de jeux odds) --------------------
@@ -324,7 +334,7 @@
 
     function updateSpreadFilterLabels() {
         if (spreadFilterDiv) {
-            const btns = spreadFilterDiv.querySelectorAll('button');
+            const btns = spreadFilterDiv.children;
             if (btns.length >= 3) {
                 btns[1].textContent = spreadPlayer1Name || 'J1';
                 btns[2].textContent = spreadPlayer2Name || 'J2';
@@ -461,9 +471,9 @@
         }
     }
 
-    // --- Sports page extraction (upcoming singles matches) --------------
+    // --- Match page extraction (Volleyball - ALL odds from ALL sections) -
     function findScrollableContainer() {
-        const grid = document.querySelector('.ReactVirtualized__Grid');
+        const grid = document.evaluate("//*[contains(concat(' ', normalize-space(@class), ' '), ' ReactVirtualized__Grid ')]", document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
         if (!grid) return window;
         let el = grid.parentElement;
         while (el && el !== document.body) {
@@ -474,6 +484,186 @@
         return window;
     }
 
+    // Expand a section: click the grid/list toggle if needed, then expand "Plus de sélections"
+    async function expandSection(sectionContainer) {
+        // Count current odds to know if we need to toggle view
+        const currentOdds = xpathNodes(".//div[starts-with(@data-testid, 'odd-button-')]", sectionContainer);
+        
+        // If <= 2 odds, the section is in compact grid view.
+        // Click the toggle (dcSvAA div with the 4-rect icon) to switch to list view.
+        if (currentOdds.length <= 2) {
+            // Find the tabs-wrapper and click the toggle with class containing "dcSvAA"
+            const tabsWrapper = document.evaluate(".//*[contains(@class, 'tabs-wrapper')]", sectionContainer, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+            if (tabsWrapper) {
+                const toggleDiv = document.evaluate(".//*[contains(@class, 'dcSvAA')]", tabsWrapper, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                if (toggleDiv && toggleDiv.click) {
+                    toggleDiv.click();
+                    await sleep(500);
+                }
+            } else {
+                // Fallback: same as tennis - find SVG with rects
+                const possibleToggles = xpathNodes(".//*[local-name()='svg' and .//*[local-name()='rect']]/parent::*", sectionContainer);
+                for (let toggle of possibleToggles) {
+                    if (toggle.click && toggle.innerText === '') {
+                        toggle.click();
+                        await sleep(500);
+                        break;
+                    }
+                }
+            }
+        }
+        
+        // Expand "Plus de sélections" once (only need to click it once)
+        const expandBtn = document.evaluate(
+            ".//div[contains(text(),'Plus de sélections')]/ancestor::div[contains(@class, 'expand-button') or contains(@class, 'expand')] | .//div[contains(text(),'Plus de sélections')]/..",
+            sectionContainer, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
+        ).singleNodeValue;
+        if (expandBtn && expandBtn.textContent.trim().includes("Plus de sélections")) {
+            expandBtn.click();
+            await sleep(500);
+        }
+    }
+
+    // Extract odds from a section: expand it, then extract, return {title, odds[]} or null
+    async function extractSectionData(headingEl) {
+        const title = headingEl.textContent.trim();
+        if (!title || title.length < 2) return null;
+
+        // Navigate up to find section container (the node that contains odds)
+        let sectionContainer = null;
+        let node = headingEl.parentNode;
+        while (node && node !== document.body) {
+            const hasOdds = document.evaluate(".//div[starts-with(@data-testid, 'odd-button-')]", node, null, XPathResult.BOOLEAN_TYPE, null).booleanValue;
+            if (hasOdds) { sectionContainer = node; break; }
+            node = node.parentNode;
+        }
+        if (!sectionContainer) return null;
+
+        // Expand the section
+        await expandSection(sectionContainer);
+
+        // Extract odds from this section
+        const oddsButtons = xpathNodes(".//div[starts-with(@data-testid, 'odd-button-')]", sectionContainer);
+        if (oddsButtons.length === 0) return null;
+
+        const sectionOdds = [];
+        for (const btn of oddsButtons) {
+            const valueSpan = document.evaluate(".//span[contains(@class, 'odd-button-value')]", btn, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+            if (!valueSpan) continue;
+            let oddValue = valueSpan.textContent.trim();
+            const valueContainer = valueSpan.parentElement;
+            const nameDiv = valueContainer ? valueContainer.previousElementSibling : null;
+            let name = nameDiv ? nameDiv.textContent.trim() : '';
+            if (!name) {
+                const possibleNameDiv = document.evaluate(".//div[contains(@class, 'fZKtql')]" , btn, null , XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                if (possibleNameDiv) name = possibleNameDiv.textContent.trim();
+            }
+            if (name && oddValue) {
+                sectionOdds.push(`${name} : ${oddValue.replace(',', '.')}`);
+            }
+        }
+
+        if (sectionOdds.length === 0) return null;
+        return { title, odds: sectionOdds };
+    }
+
+    async function extractAllOddsFromMatchVb() {
+        try {
+            showProgress('🔍 Expanding sections while scrolling...');
+            
+            // Find the scrollable container
+            const scrollable = findScrollableContainer();
+
+            // Process sections incrementally while scrolling down
+            const allResults = [];
+            const processedHeadings = new WeakSet();  // Track actual DOM elements, not position-based keys
+            const headingKeywords = [
+                'Vainqueur', 'Score exact', 'Nombre de points', 'Écart de points',
+                'Nombre de sets', 'Écart de sets', 'Nombre exact de sets',
+                'Y aura-t-il', 'remporte au moins', 'Nombre de points de'
+            ];
+
+            let prevScrollTop = -1;
+            let noNewSectionsCount = 0;
+            const MAX_NO_NEW = 15;
+
+            // Start from top
+            if (scrollable === window) {
+                window.scrollTo(0, 0);
+            } else {
+                scrollable.scrollTop = 0;
+            }
+            await sleep(300);
+
+            while (noNewSectionsCount < MAX_NO_NEW) {
+                // Find all currently visible sections with headings
+                let foundNew = false;
+                for (const kw of headingKeywords) {
+                    const headings = xpathNodes(`//div[contains(text(),'${kw}')]`);
+                    for (const h of headings) {
+                        const rect = h.getBoundingClientRect();
+                        const isVisible = rect.top < (window.innerHeight + 200) && rect.bottom > -200;
+                        if (!isVisible) continue;
+
+                        // Deduplicate by tracking the actual DOM element using WeakSet
+                        if (processedHeadings.has(h)) continue;
+                        processedHeadings.add(h);
+
+                        const data = await extractSectionData(h);
+                        if (data) {
+                            allResults.push(data.title);
+                            allResults.push(...data.odds);
+                            allResults.push('');
+                            foundNew = true;
+                        }
+                    }
+                }
+
+                if (foundNew) {
+                    noNewSectionsCount = 0;
+                } else {
+                    noNewSectionsCount++;
+                }
+
+                // Scroll down
+                const oldScrollTop = (scrollable === window) ? window.scrollY : scrollable.scrollTop;
+                if (scrollable === window) {
+                    window.scrollBy(0, 500);
+                } else {
+                    scrollable.scrollBy({ top: 500, behavior: 'auto' });
+                }
+                await sleep(250);
+                const newScrollTop = (scrollable === window) ? window.scrollY : scrollable.scrollTop;
+                if (newScrollTop === oldScrollTop && prevScrollTop === newScrollTop) break;
+                prevScrollTop = oldScrollTop;
+
+                if (scrollable === window) {
+                    if (window.innerHeight + window.scrollY >= document.body.scrollHeight - 100) break;
+                } else {
+                    if (scrollable.scrollTop + scrollable.clientHeight >= scrollable.scrollHeight - 100) break;
+                }
+            }
+
+            // Remove trailing blank line
+            while (allResults.length > 0 && allResults[allResults.length - 1] === '') {
+                allResults.pop();
+            }
+
+            if (allResults.length === 0) throw new Error("No odds extracted from any section");
+
+            const output = allResults.join('\n');
+            lastExtractedData = output;
+            await copyToClipboard(output);
+            const oddCount = output.split('\n').filter(line => line.includes(':')).length;
+            const sectionCount = output.split('\n').filter(line => line !== '' && !line.includes(':')).length;
+            showProgress(`✅ ${oddCount} odds from ${sectionCount} sections copied!`);
+        } catch (err) {
+            console.error(err);
+            showProgress(`❌ Error: ${err.message}`, true);
+        }
+    }
+
+    // --- Sports page extraction (upcoming singles matches) --------------
     const dayIndicators = ['demain', 'sam', 'dim', 'lun', 'mar', 'mer', 'jeu', 'ven'];
     function isDayIndicator(text) {
         const lower = text.toLowerCase();
@@ -549,7 +739,7 @@
 
     function extractCurrentMatches() {
         const matches = [];
-        const cards = document.querySelectorAll('[data-testid^="match-card-"]');
+        const cards = xpathNodes("//*[starts-with(@data-testid, 'match-card-')]");
         for (const card of cards) {
             try {
                 const info = extractMatchInfo(card);
@@ -715,6 +905,7 @@
         modeSelectorDiv = null;
         sectionSelectorDiv = null;
         spreadFilterDiv = null;
+        sportSelectDiv = null;
         if (progressTimeout) clearTimeout(progressTimeout);
         currentMode = null;
         lastExtractedData = '';
@@ -727,6 +918,8 @@
         sportsLimitSelectorDiv = null;
         sportsLimitBtns = [];
         sportsScanLimit = true;
+        sportType = 'tennis';
+        sportBtns = [];
     }
 
     function createBaseUI() {
@@ -795,6 +988,75 @@
         uiContainer.appendChild(progressDiv);
         uiContainer.appendChild(actionBtn);
         document.body.appendChild(uiContainer);
+    }
+
+    function createSportSelector() {
+        if (sportSelectDiv) sportSelectDiv.remove();
+
+        sportSelectDiv = document.createElement('div');
+        sportSelectDiv.style.cssText = `
+            display: flex;
+            gap: 4px;
+            justify-content: center;
+        `;
+
+        const sports = [
+            { key: 'tennis', label: '🎾 Tennis' },
+            { key: 'volleyball', label: '🏐 Volleyball' },
+        ];
+
+        sportBtns = [];
+        for (const s of sports) {
+            const btn = document.createElement('button');
+            btn.textContent = s.label;
+            btn.dataset.sport = s.key;
+            btn.style.cssText = `
+                background: rgba(255, 255, 255, 0.15);
+                border: 1px solid rgba(255, 255, 255, 0.15);
+                color: rgba(255, 255, 255, 0.7);
+                font-size: 11px;
+                font-weight: 500;
+                padding: 4px 14px;
+                min-width: 100px;
+                border-radius: 20px;
+                cursor: pointer;
+                transition: all 0.2s ease;
+                font-family: inherit;
+                letter-spacing: 0.3px;
+            `;
+            btn.addEventListener('mouseenter', () => {
+                if (btn.dataset.sport !== sportType) {
+                    btn.style.background = 'rgba(255, 255, 255, 0.25)';
+                }
+            });
+            btn.addEventListener('mouseleave', () => {
+                if (btn.dataset.sport !== sportType) {
+                    btn.style.background = 'rgba(255, 255, 255, 0.15)';
+                }
+            });
+            btn.addEventListener('click', () => {
+                sportType = btn.dataset.sport;
+                updateAllButtons();
+                // Update action button text based on sport
+                if (actionBtn) {
+                    if (sportType === 'tennis') {
+                        actionBtn.textContent = '🎾 Extract odds';
+                    } else {
+                        actionBtn.textContent = '🏐 Extract all odds';
+                    }
+                }
+            });
+            sportBtns.push(btn);
+            sportSelectDiv.appendChild(btn);
+        }
+
+        updateAllButtons();
+        // Insert at the very top of the UI (first element before section selector)
+        if (uiContainer.firstChild) {
+            uiContainer.insertBefore(sportSelectDiv, uiContainer.firstChild);
+        } else {
+            uiContainer.appendChild(sportSelectDiv);
+        }
     }
 
     function createModeSelector() {
@@ -1042,28 +1304,46 @@
         }
 
         updateAllButtons();
-        // Insert section selector before actionBtn (first in the options row)
-        uiContainer.insertBefore(sectionSelectorDiv, actionBtn);
+        // Insert section selector after sport selector
+        if (sportSelectDiv && sportSelectDiv.parentNode) {
+            sportSelectDiv.after(sectionSelectorDiv);
+        } else {
+            uiContainer.insertBefore(sectionSelectorDiv, actionBtn);
+        }
     }
 
     function createMatchUI() {
         createBaseUI();
+        createSportSelector();
         createSectionSelector();
         createModeSelector();
         createSpreadFilterSelector();
         // Pre-populate player names from the DOM if available
         detectSpreadPlayerNames();
-        actionBtn.textContent = '🎾 Extract odds';
+        
+        // Set action button based on sport type
+        if (sportType === 'tennis') {
+            actionBtn.textContent = '🎾 Extract odds';
+        } else {
+            actionBtn.textContent = '🏐 Extract all odds';
+        }
+        
         actionBtn.onclick = async () => {
             if (actionBtn.disabled) return;
             actionBtn.disabled = true;
             const originalText = actionBtn.textContent;
-            actionBtn.textContent = '⏳ Extracting...';
-            if (sectionType === 'Total Games') {
+            
+            if (sportType === 'volleyball') {
+                actionBtn.textContent = '⏳ Extracting...';
+                await extractAllOddsFromMatchVb();
+            } else if (sectionType === 'Total Games') {
+                actionBtn.textContent = '⏳ Extracting...';
                 await extractOddsFromMatch();
             } else {
+                actionBtn.textContent = '⏳ Extracting...';
                 await extractSpreadOddsFromMatch();
             }
+            
             actionBtn.disabled = false;
             actionBtn.textContent = originalText;
         };
