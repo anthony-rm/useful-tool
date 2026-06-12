@@ -1,0 +1,112 @@
+---
+description: Comprehensive guidelines, coding standards, and workflows for maintaining and developing the Winamax Tennis & Volleyball Tools userscript.
+author: Cline
+version: 1.0
+category: "Project Rules"
+tags: ["tampermonkey", "userscript", "xpath", "vanilla-js", "ui-ux"]
+globs: ["script.js", "**/*.js"]
+---
+
+# Winamax Tennis & Volleyball Tools Development Rules
+
+This document defines the core principles, coding standards, UI/UX guidelines, and testing workflows for the Winamax Tennis & Volleyball Tools userscript. All modifications and additions to the codebase MUST adhere to these rules.
+
+---
+
+## 1. Tampermonkey Metadata Block
+
+The metadata block at the top of `script.js` is critical for the userscript's execution, updates, and permissions.
+
+### Rules:
+* **Preserve Header:** NEVER delete, corrupt, or accidentally modify the `// ==UserScript==` and `// ==/UserScript==` boundaries.
+* **Version Control:** You MUST increment the `@version` (e.g., `9.1` -> `9.2`) whenever making functional changes, bug fixes, or feature additions.
+* **Permissions:** Do NOT add new `@grant` rules unless absolutely necessary for new functionality, and always document why.
+* **Match Patterns:** Ensure `@match` patterns remain restricted to `https://www.winamax.fr/*` to respect user privacy and security.
+
+---
+
+## 2. XPath Safety & DOM Querying
+
+Since Winamax uses a dynamic, single-page application (SPA) framework with compiled/minified class names, DOM querying must be extremely resilient.
+
+### Rules:
+* **Use Helpers:** ALWAYS prefer the existing helper functions `xpathNodes(xpath, context)` and `waitForXPath(xpath, timeout, context)` over raw `document.evaluate` calls.
+* **Resilient XPaths:** Avoid using absolute XPaths or relying on fragile, auto-generated CSS class names (e.g., `hukOGC`, `fZKtql`). Instead, use:
+  * Text content matching: `//div[contains(text(), 'Nombre de jeux')]`
+  * Test IDs: `//*[starts-with(@data-testid, 'odd-button-')]`
+  * Relative relationships: Finding a stable heading and navigating to its parent/ancestor container.
+* **Fallback Mechanisms:** If a minified class name MUST be used as a last resort, always implement a robust fallback (e.g., checking multiple possible classes or structure-based navigation) and document it with comments.
+
+---
+
+## 3. UI/UX & Styling Guidelines
+
+The userscript injects a floating control panel into the Winamax interface. It must look professional, feel native, and not interfere with the website's usability.
+
+### Rules:
+* **Dynamic Theme Support:** The UI MUST support both light and dark modes dynamically.
+  * Use `window.matchMedia('(prefers-color-scheme: dark)')` to detect the system theme.
+  * Update colors, backgrounds, and borders dynamically when the system theme changes.
+* **Visual Feedback & States:**
+  * Buttons MUST have clear hover effects (e.g., subtle scale up, shadow changes).
+  * During asynchronous operations (like scanning or extracting), buttons MUST be disabled, show a loading state (e.g., `⏳ Scanning...`), and change the cursor to `wait`.
+  * Show clear, auto-fading progress/success/error notifications using the `showProgress` helper.
+* **Non-Intrusive Layout:** Keep the UI compact, fixed to the bottom-right corner, and ensure it uses a high `z-index` (e.g., `9999`) to stay on top of Winamax elements without blocking critical betting slips.
+
+---
+
+## 4. Cross-Browser Compatibility & Clipboard Operations
+
+The script is used across different browsers (Chrome, Firefox, Safari) and userscript managers (Tampermonkey, Violentmonkey, Safari Userscripts).
+
+### Rules:
+* **Dual-Method Clipboard Copy:** ALWAYS use the dual-method fallback pattern implemented in `copyToClipboard(text)`:
+  1. Try the modern standard Web API first: `navigator.clipboard.writeText(text)`.
+  2. Fall back to `GM_setClipboard(text, 'text')` if the Web API fails or is blocked by browser security policies.
+* **Vanilla JavaScript Only:** **STRICTLY FORBIDDEN** to use external libraries like jQuery, Lodash, or external CSS frameworks. All operations must be written in clean, modern, vanilla ES6+ JavaScript.
+
+---
+
+## 5. Performance & Infinite Scroll Handling
+
+Volleyball extraction and sports page scanning require scrolling and processing large amounts of dynamic DOM elements.
+
+### Rules:
+* **Asynchronous Delays:** ALWAYS include appropriate `sleep(ms)` delays when simulating scrolls or waiting for elements to load. This prevents browser UI freezing and avoids triggering rate-limits.
+* **Deduplication:** When scanning elements during scrolling, use a `WeakSet` or unique string keys (e.g., `${player1}|${player2}`) to track and deduplicate processed elements.
+* **Infinite Scroll Boundaries:** Implement safety limits (like `sportsScanLimit` or `MAX_NO_NEW` scroll attempts) to prevent infinite loops if the page fails to load more content or reaches the end.
+
+---
+
+## 6. Verification & Testing Workflow
+
+Before proposing or finalizing any changes, follow this verification protocol:
+
+### Step-by-Step Verification:
+1. **Syntax Check:** Ensure the JavaScript code is syntactically valid and free of linting errors.
+2. **Dry Run Analysis:** Walk through the modified logic step-by-step to ensure no variables are undefined and all helper functions are called with correct arguments.
+3. **Console Logging:** Add clear, non-intrusive `console.log` or `console.warn` statements for debugging complex extraction paths.
+4. **User Instructions:** When presenting changes, provide clear instructions on how the user can copy the code into Tampermonkey and test it on the live Winamax site.
+
+---
+
+## 7. Code Patterns to Avoid vs. Use
+
+### ❌ NEVER DO THIS:
+```javascript
+// Fragile XPath relying on exact minified class names
+const btn = document.evaluate("//div[@class='hukOGC']", document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+
+// Blocking synchronous sleep
+const start = Date.now();
+while (Date.now() - start < 1000) {}
+```
+
+### ✅ ALWAYS DO THIS:
+```javascript
+// Resilient XPath using text content and helper
+const btn = await waitForXPath("//div[contains(text(),'Plus de sélections')]");
+
+// Non-blocking asynchronous sleep
+await sleep(500);
+```
