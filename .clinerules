@@ -13,7 +13,17 @@ This document defines the core principles, coding standards, UI/UX guidelines, a
 
 ---
 
-## 1. Tampermonkey Metadata Block
+## 1. Language Guidelines
+
+### Rules:
+* **User Communication:** Users may write in either French or English.
+* **Agent Responses:** All agent responses and internal thinking must be in English.
+* **Code:** All code, including comments, variable names, and documentation, must be written in English.
+* **User Interface:** The user interface elements (buttons, labels, messages) must be in English.
+
+---
+
+## 2. Tampermonkey Metadata Block
 
 The metadata block at the top of `script.js` is critical for the userscript's execution, updates, and permissions.
 
@@ -25,7 +35,7 @@ The metadata block at the top of `script.js` is critical for the userscript's ex
 
 ---
 
-## 2. XPath Safety & DOM Querying
+## 3. XPath Safety & DOM Querying
 
 Since Winamax uses a dynamic, single-page application (SPA) framework with compiled/minified class names, DOM querying must be extremely resilient.
 
@@ -39,7 +49,7 @@ Since Winamax uses a dynamic, single-page application (SPA) framework with compi
 
 ---
 
-## 3. UI/UX & Styling Guidelines
+## 4. UI/UX & Styling Guidelines
 
 The userscript injects a floating control panel into the Winamax interface. It must look professional, feel native, and not interfere with the website's usability.
 
@@ -55,7 +65,7 @@ The userscript injects a floating control panel into the Winamax interface. It m
 
 ---
 
-## 4. Cross-Browser Compatibility & Clipboard Operations
+## 5. Cross-Browser Compatibility & Clipboard Operations
 
 The script is used across different browsers (Chrome, Firefox, Safari) and userscript managers (Tampermonkey, Violentmonkey, Safari Userscripts).
 
@@ -67,7 +77,7 @@ The script is used across different browsers (Chrome, Firefox, Safari) and users
 
 ---
 
-## 5. Performance & Infinite Scroll Handling
+## 6. Performance & Infinite Scroll Handling
 
 Volleyball extraction and sports page scanning require scrolling and processing large amounts of dynamic DOM elements.
 
@@ -78,7 +88,7 @@ Volleyball extraction and sports page scanning require scrolling and processing 
 
 ---
 
-## 6. Verification & Testing Workflow
+## 7. Verification & Testing Workflow
 
 Before proposing or finalizing any changes, follow this verification protocol:
 
@@ -90,7 +100,7 @@ Before proposing or finalizing any changes, follow this verification protocol:
 
 ---
 
-## 7. Code Patterns to Avoid vs. Use
+## 8. Code Patterns to Avoid vs. Use
 
 ### ❌ NEVER DO THIS:
 ```javascript
@@ -110,3 +120,31 @@ const btn = await waitForXPath("//div[contains(text(),'Plus de sélections')]");
 // Non-blocking asynchronous sleep
 await sleep(500);
 ```
+
+## 9. Code Architecture & Global Logic
+
+### Page Modes & Routing
+* **Match Mode (`https://www.winamax.fr/paris-sportifs/match/*`):**
+  * **Tennis:** Extracts "Total Games" (Over/Under) or "Games Spread" (Handicaps).
+  * **Volleyball:** Extracts ALL odds from all visible sections by expanding collapsed headers.
+* **Sports Mode (`https://www.winamax.fr/paris-sportifs/sports/5`):**
+  * Scans the live/upcoming matches list, scrolls dynamically, and extracts match metadata (players, time, match winner odds).
+
+### Global State Variables
+* `sportType`: `'tennis'` | `'volleyball'` (Determines extraction logic in Match mode).
+* `currentMode`: `'match'` | `'sports'` (Set by `getPageMode()` based on URL).
+* `oddsMode`: `'all'` | `'over'` | `'under'` (Filters Tennis Total Games).
+* `sectionType`: `'Total Games'` | `'Games Spread'` (Tennis Match mode sub-selection).
+* `spreadFilter`: `'all'` | `'player1'` | `'player2'` (Filters Tennis handicaps).
+* `sportsScanLimit`: `true` | `false` (If `true`, stops Sports scanning when a night gap is detected).
+
+### Core Execution Flows
+1. **Initialization:** `watchForNavigation()` detects URL changes, calls `checkAndUpdateUI()` to inject/remove the floating panel.
+2. **UI Rendering:** `createBaseUI()` builds the container, and sport/mode-specific selectors are appended dynamically based on `currentMode` and `sportType`.
+3. **Extraction & Copy:** Clicking the primary action button triggers the respective extraction function (`extractOddsFromMatch`, `extractAllOddsFromMatchVb`, or `handleSportsExtract`), shows visual feedback, and copies the formatted string to the clipboard.
+
+### Expected Clipboard Formats
+* **Tennis Total Games:** `[Line] [Over_Odd] [Under_Odd]` (sorted numerically by line).
+* **Tennis Spread:** `[Player] [Spread] [Odd]`.
+* **Volleyball:** Structured text block containing all extracted market names and their respective odds.
+* **Sports Page:** Tab-separated or structured list of matches: `[Time] [Player 1] - [Player 2] [Odd 1] [Odd 2]`.

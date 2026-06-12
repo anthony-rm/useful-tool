@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Winamax Tennis & Volleyball Tools
 // @namespace    http://tampermonkey.net/
-// @version      9.1
+// @version      9.2
 // @description  Extracts betting odds from Winamax match pages. Tennis: "Number of Games" & "Game Spread" odds. Volleyball: ALL odds from all sections. Features dynamic UI, clipboard copy, dark/light theme.
 // @match        https://www.winamax.fr/*
 // @updateURL    https://raw.githubusercontent.com/anthony-rm/useful-tool/main/script.js
@@ -77,7 +77,7 @@
     let extractedMatches = [];     // for sports mode
     let oddsMode = 'all';          // 'all', 'over', 'under' for match mode
     let modeSelectorDiv = null;    // mode toggle UI container
-    let sectionType = 'Total Games'; // 'Total Games' or 'Games Spread'
+    let sectionType = 'Total Games'; // 'All', 'Total Games' or 'Games Spread'
     let sectionSelectorDiv = null;     // section toggle UI container
     let spreadFilter = 'all';          // 'all', 'player1', 'player2' for spread mode
     let spreadFilterDiv = null;        // spread filter UI container
@@ -89,9 +89,6 @@
     let sportsScanLimit = true;        // for sports mode (true = stop at night gap)
     let sportsLimitSelectorDiv = null; // sports range toggle UI
     let sportsLimitBtns = [];          // store sports limit button references
-    let sportType = 'tennis';          // 'tennis' or 'volleyball' for match mode
-    let sportSelectDiv = null;         // sport selector UI container
-    let sportBtns = [];                // store sport button references
 
     // --- Theming --------------------------------------------------------
     function updateProgressTheme() {
@@ -155,26 +152,23 @@
             btn.style.fontWeight = isActive ? '700' : '500';
         });
 
-        // Update sport buttons
-        sportBtns.forEach(btn => {
-            const isActive = btn.dataset.sport === sportType;
-            btn.style.background = isActive ? 'linear-gradient(135deg, #1e6df2, #0a4bc2)' : 'rgba(255, 255, 255, 0.15)';
-            btn.style.color = isActive ? 'white' : 'rgba(255, 255, 255, 0.7)';
-            btn.style.borderColor = isActive ? 'rgba(255,255,255,0.4)' : 'rgba(255,255,255,0.15)';
-            btn.style.fontWeight = isActive ? '700' : '500';
-        });
-
         // Update filter button labels with player names
         if (filterBtns.length >= 3) {
             filterBtns[1].textContent = spreadPlayer1Name || 'J1';
             filterBtns[2].textContent = spreadPlayer2Name || 'J2';
         }
 
-        // Show/hide tennis-specific controls based on sport type
-        const isTennis = sportType === 'tennis';
-        if (sectionSelectorDiv) sectionSelectorDiv.style.display = isTennis ? 'flex' : 'none';
-        if (modeSelectorDiv) modeSelectorDiv.style.display = (isTennis && sectionType === 'Total Games') ? 'flex' : 'none';
-        if (spreadFilterDiv) spreadFilterDiv.style.display = (isTennis && sectionType === 'Games Spread') ? 'flex' : 'none';
+        // Show/hide controls based on section type
+        if (sectionType === 'All') {
+            if (modeSelectorDiv) modeSelectorDiv.style.display = 'none';
+            if (spreadFilterDiv) spreadFilterDiv.style.display = 'none';
+        } else if (sectionType === 'Total Games') {
+            if (modeSelectorDiv) modeSelectorDiv.style.display = 'flex';
+            if (spreadFilterDiv) spreadFilterDiv.style.display = 'none';
+        } else if (sectionType === 'Games Spread') {
+            if (modeSelectorDiv) modeSelectorDiv.style.display = 'none';
+            if (spreadFilterDiv) spreadFilterDiv.style.display = 'flex';
+        }
     }
 
     // --- Match page extraction (Nombre de jeux odds) --------------------
@@ -905,7 +899,6 @@
         modeSelectorDiv = null;
         sectionSelectorDiv = null;
         spreadFilterDiv = null;
-        sportSelectDiv = null;
         if (progressTimeout) clearTimeout(progressTimeout);
         currentMode = null;
         lastExtractedData = '';
@@ -918,8 +911,6 @@
         sportsLimitSelectorDiv = null;
         sportsLimitBtns = [];
         sportsScanLimit = true;
-        sportType = 'tennis';
-        sportBtns = [];
     }
 
     function createBaseUI() {
@@ -990,26 +981,27 @@
         document.body.appendChild(uiContainer);
     }
 
-    function createSportSelector() {
-        if (sportSelectDiv) sportSelectDiv.remove();
+    function createMainSelector() {
+        if (sectionSelectorDiv) sectionSelectorDiv.remove();
 
-        sportSelectDiv = document.createElement('div');
-        sportSelectDiv.style.cssText = `
+        sectionSelectorDiv = document.createElement('div');
+        sectionSelectorDiv.style.cssText = `
             display: flex;
             gap: 4px;
             justify-content: center;
         `;
 
-        const sports = [
-            { key: 'tennis', label: '🎾 Tennis' },
-            { key: 'volleyball', label: '🏐 Volleyball' },
+        const sections = [
+            { key: 'All', label: 'All' },
+            { key: 'Total Games', label: 'Tennis Total Games' },
+            { key: 'Games Spread', label: 'Tennis Games Spread' },
         ];
 
-        sportBtns = [];
-        for (const s of sports) {
+        sectionBtns = [];
+        for (const s of sections) {
             const btn = document.createElement('button');
             btn.textContent = s.label;
-            btn.dataset.sport = s.key;
+            btn.dataset.section = s.key;
             btn.style.cssText = `
                 background: rgba(255, 255, 255, 0.15);
                 border: 1px solid rgba(255, 255, 255, 0.15);
@@ -1025,38 +1017,37 @@
                 letter-spacing: 0.3px;
             `;
             btn.addEventListener('mouseenter', () => {
-                if (btn.dataset.sport !== sportType) {
+                if (btn.dataset.section !== sectionType) {
                     btn.style.background = 'rgba(255, 255, 255, 0.25)';
                 }
             });
             btn.addEventListener('mouseleave', () => {
-                if (btn.dataset.sport !== sportType) {
+                if (btn.dataset.section !== sectionType) {
                     btn.style.background = 'rgba(255, 255, 255, 0.15)';
                 }
             });
             btn.addEventListener('click', () => {
-                sportType = btn.dataset.sport;
+                sectionType = btn.dataset.section;
                 updateAllButtons();
-                // Update action button text based on sport
+                // Update action button text
                 if (actionBtn) {
-                    if (sportType === 'tennis') {
-                        actionBtn.textContent = '🎾 Extract odds';
+                    if (sectionType === 'All') {
+                        actionBtn.textContent = '🎾 Extract all odds';
                     } else {
-                        actionBtn.textContent = '🏐 Extract all odds';
+                        actionBtn.textContent = '🎾 Extract odds';
                     }
                 }
+                // Detect player names when switching to Games Spread (deferred to avoid blocking UI)
+                if (sectionType === 'Games Spread') {
+                    setTimeout(() => detectSpreadPlayerNames(), 0);
+                }
             });
-            sportBtns.push(btn);
-            sportSelectDiv.appendChild(btn);
+            sectionBtns.push(btn);
+            sectionSelectorDiv.appendChild(btn);
         }
 
         updateAllButtons();
-        // Insert at the very top of the UI (first element before section selector)
-        if (uiContainer.firstChild) {
-            uiContainer.insertBefore(sportSelectDiv, uiContainer.firstChild);
-        } else {
-            uiContainer.appendChild(sportSelectDiv);
-        }
+        uiContainer.insertBefore(sectionSelectorDiv, actionBtn);
     }
 
     function createModeSelector() {
@@ -1243,98 +1234,24 @@
         uiContainer.insertBefore(sportsLimitSelectorDiv, actionBtn);
     }
 
-    function createSectionSelector() {
-        if (sectionSelectorDiv) sectionSelectorDiv.remove();
-
-        sectionSelectorDiv = document.createElement('div');
-        sectionSelectorDiv.style.cssText = `
-            display: flex;
-            gap: 4px;
-            justify-content: center;
-        `;
-
-        const sections = [
-            { key: 'Total Games', label: 'Total Games' },
-            { key: 'Games Spread', label: 'Games Spread' },
-        ];
-
-        sectionBtns = [];
-        for (const s of sections) {
-            const btn = document.createElement('button');
-            btn.textContent = s.label;
-            btn.dataset.section = s.key;
-            btn.style.cssText = `
-                background: rgba(255, 255, 255, 0.15);
-                border: 1px solid rgba(255, 255, 255, 0.15);
-                color: rgba(255, 255, 255, 0.7);
-                font-size: 11px;
-                font-weight: 500;
-                padding: 4px 14px;
-                min-width: 80px;
-                border-radius: 20px;
-                cursor: pointer;
-                transition: all 0.2s ease;
-                font-family: inherit;
-                letter-spacing: 0.3px;
-            `;
-            btn.addEventListener('mouseenter', () => {
-                if (btn.dataset.section !== sectionType) {
-                    btn.style.background = 'rgba(255, 255, 255, 0.25)';
-                }
-            });
-            btn.addEventListener('mouseleave', () => {
-                if (btn.dataset.section !== sectionType) {
-                    btn.style.background = 'rgba(255, 255, 255, 0.15)';
-                }
-            });
-            btn.addEventListener('click', () => {
-                sectionType = btn.dataset.section;
-                updateAllButtons();
-                // Update action button text
-                if (actionBtn) {
-                    actionBtn.textContent = '🎾 Extract odds';
-                }
-                // Detect player names when switching to Games Spread (deferred to avoid blocking UI)
-                if (sectionType === 'Games Spread') {
-                    setTimeout(() => detectSpreadPlayerNames(), 0);
-                }
-            });
-            sectionBtns.push(btn);
-            sectionSelectorDiv.appendChild(btn);
-        }
-
-        updateAllButtons();
-        // Insert section selector after sport selector
-        if (sportSelectDiv && sportSelectDiv.parentNode) {
-            sportSelectDiv.after(sectionSelectorDiv);
-        } else {
-            uiContainer.insertBefore(sectionSelectorDiv, actionBtn);
-        }
-    }
-
     function createMatchUI() {
         createBaseUI();
-        createSportSelector();
-        createSectionSelector();
+        createMainSelector();
         createModeSelector();
         createSpreadFilterSelector();
         // Pre-populate player names from the DOM if available
         detectSpreadPlayerNames();
         
-        // Set action button based on sport type
-        if (sportType === 'tennis') {
-            actionBtn.textContent = '🎾 Extract odds';
-        } else {
-            actionBtn.textContent = '🏐 Extract all odds';
-        }
+        // Set default action button text
+        actionBtn.textContent = '🎾 Extract odds';
         
         actionBtn.onclick = async () => {
             if (actionBtn.disabled) return;
             actionBtn.disabled = true;
             const originalText = actionBtn.textContent;
             
-            if (sportType === 'volleyball') {
-                actionBtn.textContent = '⏳ Extracting...';
+            if (sectionType === 'All') {
+                actionBtn.textContent = '⏳ Extracting all...';
                 await extractAllOddsFromMatchVb();
             } else if (sectionType === 'Total Games') {
                 actionBtn.textContent = '⏳ Extracting...';
