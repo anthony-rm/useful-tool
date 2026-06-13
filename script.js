@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Winamax Tennis & Volleyball Tools
 // @namespace    http://tampermonkey.net/
-// @version      9.2
+// @version      9.3
 // @description  Extracts betting odds from Winamax match pages. Tennis: "Number of Games" & "Game Spread" odds. Volleyball: ALL odds from all sections. Features dynamic UI, clipboard copy, dark/light theme.
 // @match        https://www.winamax.fr/*
 // @updateURL    https://raw.githubusercontent.com/anthony-rm/useful-tool/main/script.js
@@ -15,25 +15,52 @@
     // --- Shared helpers -------------------------------------------------
     function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
-    // Cross-browser clipboard copy (compatible with Safari Userscripts, Tampermonkey, etc.)
-    async function copyToClipboard(text) {
-        try {
-            // Try standard Web API first (works in Safari, modern browsers)
-            await navigator.clipboard.writeText(text);
-            return true;
-        } catch (err) {
-            // Fallback to GM_setClipboard for Tampermonkey/other extensions
-            try {
-                if (typeof GM_setClipboard !== 'undefined') {
-                    GM_setClipboard(text, 'text');
-                    return true;
-                }
-            } catch (gmErr) {
-                console.error('Clipboard failed:', gmErr);
-            }
-            return false;
-        }
+// Cross-browser clipboard copy (compatible with Safari iOS, Safari Userscripts, Tampermonkey, etc.)
+async function copyToClipboard(text) {
+    // Method 1: Standard Web API
+    try {
+        await navigator.clipboard.writeText(text);
+        return true;
+    } catch (err) {
+        console.log('Web Clipboard API failed, trying fallbacks...');
     }
+
+    // Method 2: GM_setClipboard
+    try {
+        if (typeof GM_setClipboard !== 'undefined') {
+            GM_setClipboard(text, 'text');
+            return true;
+        }
+    } catch (gmErr) {
+        console.log('GM_setClipboard failed, trying textarea method...');
+    }
+
+    // Method 3: Textarea method (for iOS Safari)
+    try {
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.style.position = 'fixed'; // Avoid scrolling to bottom
+        document.body.appendChild(textarea);
+        textarea.select();
+        
+        // iOS requires this range selection
+        const range = document.createRange();
+        range.selectNodeContents(textarea);
+        const selection = window.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+        textarea.setSelectionRange(0, 999999); // For mobile devices
+        
+        const successful = document.execCommand('copy');
+        document.body.removeChild(textarea);
+        
+        if (successful) return true;
+    } catch (err) {
+        console.error('Textarea copy method failed:', err);
+    }
+
+    return false;
+}
 
     // Evaluate XPath and return array of nodes
     function xpathNodes(xpath, context = document) {
