@@ -460,27 +460,39 @@ async function copyToClipboard(text) {
                 filteredOdds = oddsList.filter(o => o.name.includes(spreadPlayer2Name));
             }
 
-            // Group by handicap absolute value and sort
-            const grouped = {};
+            // Group odds by player
+            const playerOdds = {};
             for (const o of filteredOdds) {
-                const match = o.name.match(/([+-]\d+(?:[.,]\d+)?)/);
-                const key = match ? match[1] : o.name;
-                if (!grouped[key]) grouped[key] = [];
-                grouped[key].push(o);
+                // Extract player name (text before the handicap)
+                const match = o.name.match(/^(.+?)\s+([+-]\d+(?:[.,]\d+)?)$/);
+                if (!match) continue;
+                
+                const playerName = match[1].trim();
+                const handicap = match[2];
+                
+                if (!playerOdds[playerName]) {
+                    playerOdds[playerName] = [];
+                }
+                
+                // Store both the full name and the numeric value for sorting
+                playerOdds[playerName].push({
+                    full: o.name,
+                    value: o.value,
+                    handicap: parseFloat(handicap.replace(',', '.'))
+                });
             }
 
-            // Sort handicap keys numerically
-            const sortedKeys = Object.keys(grouped).sort((a, b) => {
-                const numA = parseFloat(a.replace(',', '.'));
-                const numB = parseFloat(b.replace(',', '.'));
-                return numA - numB;
-            });
+            // Sort each player's odds by handicap value
+            for (const player in playerOdds) {
+                playerOdds[player].sort((a, b) => a.handicap - b.handicap);
+            }
 
+            // Format output - all of player1's odds first, then player2's
             const formattedOdds = [];
-            for (const key of sortedKeys) {
-                const items = grouped[key];
-                // Each handicap group has 2 items (one per player)
-                formattedOdds.push(items.map(o => `${o.name} : ${o.value}`).join(' | '));
+            for (const player in playerOdds) {
+                for (const odd of playerOdds[player]) {
+                    formattedOdds.push(`${odd.full} : ${odd.value}`);
+                }
             }
 
             lastExtractedData = formattedOdds.join('\n');
