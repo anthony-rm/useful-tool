@@ -1,8 +1,7 @@
 // ==UserScript==
-// @name         Winamax Tennis & Volleyball Tools
-// @namespace    http://tampermonkey.net/
-// @version      9.10
-// @description  Extracts betting odds from Winamax match pages. Features per-section "Extract" buttons and a global "Extract all odds" button. Clipboard copy, dark/light theme support.
+// @name         Winamax Tools
+// @version      9.14
+// @description  Extracts betting odds from Winamax.
 // @match        https://www.winamax.fr/*
 // @updateURL    https://raw.githubusercontent.com/anthony-rm/useful-tool/main/script.js
 // @downloadURL  https://raw.githubusercontent.com/anthony-rm/useful-tool/main/script.js
@@ -15,52 +14,52 @@
     // --- Shared helpers -------------------------------------------------
     function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
-// Cross-browser clipboard copy (compatible with Safari iOS, Safari Userscripts, Tampermonkey, etc.)
-async function copyToClipboard(text) {
-    // Method 1: Standard Web API
-    try {
-        await navigator.clipboard.writeText(text);
-        return true;
-    } catch (err) {
-        console.log('Web Clipboard API failed, trying fallbacks...');
-    }
-
-    // Method 2: GM_setClipboard
-    try {
-        if (typeof GM_setClipboard !== 'undefined') {
-            GM_setClipboard(text, 'text');
+    // Cross-browser clipboard copy (compatible with Safari iOS, Safari Userscripts, Tampermonkey, etc.)
+    async function copyToClipboard(text) {
+        // Method 1: Standard Web API
+        try {
+            await navigator.clipboard.writeText(text);
             return true;
+        } catch (err) {
+            console.log('Web Clipboard API failed, trying fallbacks...');
         }
-    } catch (gmErr) {
-        console.log('GM_setClipboard failed, trying textarea method...');
-    }
 
-    // Method 3: Textarea method (for iOS Safari)
-    try {
-        const textarea = document.createElement('textarea');
-        textarea.value = text;
-        textarea.style.position = 'fixed'; // Avoid scrolling to bottom
-        document.body.appendChild(textarea);
-        textarea.select();
-        
-        // iOS requires this range selection
-        const range = document.createRange();
-        range.selectNodeContents(textarea);
-        const selection = window.getSelection();
-        selection.removeAllRanges();
-        selection.addRange(range);
-        textarea.setSelectionRange(0, 999999); // For mobile devices
-        
-        const successful = document.execCommand('copy');
-        document.body.removeChild(textarea);
-        
-        if (successful) return true;
-    } catch (err) {
-        console.error('Textarea copy method failed:', err);
-    }
+        // Method 2: GM_setClipboard
+        try {
+            if (typeof GM_setClipboard !== 'undefined') {
+                GM_setClipboard(text, 'text');
+                return true;
+            }
+        } catch (gmErr) {
+            console.log('GM_setClipboard failed, trying textarea method...');
+        }
 
-    return false;
-}
+        // Method 3: Textarea method (for iOS Safari)
+        try {
+            const textarea = document.createElement('textarea');
+            textarea.value = text;
+            textarea.style.position = 'fixed'; // Avoid scrolling to bottom
+            document.body.appendChild(textarea);
+            textarea.select();
+            
+            // iOS requires this range selection
+            const range = document.createRange();
+            range.selectNodeContents(textarea);
+            const selection = window.getSelection();
+            selection.removeAllRanges();
+            selection.addRange(range);
+            textarea.setSelectionRange(0, 999999); // For mobile devices
+            
+            const successful = document.execCommand('copy');
+            document.body.removeChild(textarea);
+            
+            if (successful) return true;
+        } catch (err) {
+            console.error('Textarea copy method failed:', err);
+        }
+
+        return false;
+    }
 
     // Evaluate XPath and return array of nodes
     function xpathNodes(xpath, context = document) {
@@ -100,7 +99,6 @@ async function copyToClipboard(text) {
     let actionBtn = null;      // primary button (Extract)
     let progressTimeout = null;
     let currentMode = null;
-    let lastExtractedData = '';   // for match mode
     let extractedMatches = [];     // for sports mode
     let sportsScanLimit = true;        // for sports mode (true = stop at night gap)
     let sportsLimitSelectorDiv = null; // sports range toggle UI
@@ -110,15 +108,6 @@ async function copyToClipboard(text) {
     let processedSectionHeadings = null;
     let sectionInjectObserver = null;
 
-    // --- Theming --------------------------------------------------------
-    function updateProgressTheme() {
-        if (!progressDiv) return;
-        const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-        progressDiv.style.background = isDark ? 'rgba(20, 20, 30, 0.92)' : 'rgba(245, 245, 255, 0.92)';
-        progressDiv.style.color = isDark ? '#f0f0f0' : '#1a1a2e';
-        progressDiv.style.border = isDark ? '1px solid rgba(255,255,255,0.15)' : '1px solid rgba(0,0,0,0.1)';
-    }
-
     function showProgress(text, isError = false) {
         if (!progressDiv) return;
         if (progressTimeout) clearTimeout(progressTimeout);
@@ -126,9 +115,7 @@ async function copyToClipboard(text) {
         progressDiv.textContent = text;
         progressDiv.style.background = isError
             ? 'rgba(220, 53, 69, 0.95)'
-            : (window.matchMedia('(prefers-color-scheme: dark)').matches
-                ? 'rgba(20, 20, 30, 0.92)'
-                : 'rgba(245, 245, 255, 0.92)');
+            : 'rgba(20, 20, 30, 0.92)';
         progressTimeout = setTimeout(() => {
             if (progressDiv && progressDiv.style.display === 'block') progressDiv.style.display = 'none';
         }, 3000);
@@ -178,7 +165,8 @@ async function copyToClipboard(text) {
 
                 // Skip if this is actually the "Extract" button itself or contains one
                 if (h.dataset.sectionExtract === 'true') continue;
-                if (h.querySelector('[data-section-extract="true"]')) continue;
+                const hasBtn = document.evaluate(".//*[@data-section-extract='true']", h, null, XPathResult.BOOLEAN_TYPE, null).booleanValue;
+                if (hasBtn) continue;
 
                 // Skip if child of a heading we already captured (avoid duplicates)
                 let isDuplicate = false;
@@ -395,7 +383,7 @@ async function copyToClipboard(text) {
                     await sleep(500);
                 }
             } else {
-                // Fallback: same as tennis - find SVG with rects
+                // Fallback: find SVG with rects
                 const possibleToggles = xpathNodes(".//*[local-name()='svg' and .//*[local-name()='rect']]/parent::*", sectionContainer);
                 for (let toggle of possibleToggles) {
                     if (toggle.click && toggle.innerText === '') {
@@ -407,15 +395,184 @@ async function copyToClipboard(text) {
             }
         }
         
-        // Expand "Plus de sélections" once (only need to click it once)
-        const expandBtn = document.evaluate(
+        // Expand ALL "Plus de sélections" buttons (multiple teams per section)
+        const expandBtns = xpathNodes(
             ".//div[contains(text(),'Plus de sélections')]/ancestor::div[contains(@class, 'expand-button') or contains(@class, 'expand')] | .//div[contains(text(),'Plus de sélections')]/..",
+            sectionContainer
+        );
+        for (const btn of expandBtns) {
+            if (btn.textContent.trim().includes("Plus de sélections")) {
+                btn.click();
+                await sleep(200);
+            }
+        }
+    }
+
+    // Detect if a section is a player-market section (e.g., "Joueur décisif") with 
+    // team sub-sections and column categories (Buteur/Passeur/Décisif).
+    function isPlayerMarketSection(sectionContainer) {
+        return document.evaluate(
+            ".//*[contains(@class, 'bet-group-template')]",
+            sectionContainer, null, XPathResult.BOOLEAN_TYPE, null
+        ).booleanValue;
+    }
+
+    // Extract odds from player-market sections where each team has players
+    // and odds are in columns (e.g., Buteur/Passeur/Décisif).
+    // Expected structure:
+    //   bet-group-template → sc-cKNVVb (container) → sc-feUZmu (team header + rows)
+    //   Team name: sc-fUnMCh element
+    //   Player blocks: sc-fQZEtd (one per player) with name in sc-hnpbor.joqxXd
+    //   Odds for each player: sc-iPRpaO > sc-dTyONn > .bet-group-outcome-odd (3 columns)
+    async function extractPlayerMarketOdds(sectionContainer, title) {
+        const sectionOdds = [];
+
+        // Get all team sub-containers: each .sc-cKNVVb is a team block
+        // (Inside bet-group-template, there are two .sc-cKNVVb containers:
+        //  one for each team.)
+        const teamContainers = xpathNodes(
+            ".//*[contains(@class, 'bet-group-template')]/*[contains(@class, 'sc-cKNVVb')]",
+            sectionContainer
+        );
+
+        if (teamContainers.length === 0) return null;
+
+        // Extract column headers from the bet-group-template header row
+        // Look for the header row (sc-eKvyHJ or similar) containing column names
+        let columnHeaders = [];
+        const headerRow = document.evaluate(
+            ".//*[contains(@class, 'bet-group-template')]/*[contains(@class, 'sc-eKvyHJ')]",
             sectionContainer, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
         ).singleNodeValue;
-        if (expandBtn && expandBtn.textContent.trim().includes("Plus de sélections")) {
-            expandBtn.click();
-            await sleep(500);
+        if (headerRow) {
+            const headerCells = xpathNodes(".//p", headerRow);
+            columnHeaders = headerCells.map(c => c.textContent.trim());
         }
+
+        for (const teamContainer of teamContainers) {
+            // Find team name: look for the team flag name element (sc-fUnMCh)
+            const teamNameEl = document.evaluate(
+                ".//*[contains(@class, 'sc-fUnMCh')]",
+                teamContainer, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
+            ).singleNodeValue;
+            const teamName = teamNameEl ? teamNameEl.textContent.trim() : '';
+
+            // Find player blocks: each player has a name + 3 odds
+            // Player blocks are divs that contain a player name and have odds as children
+            // They are directly inside the sc-cKNVVb container after the team header
+            // Strategy: find all elements containing player names (sc-hnpbor.joqxXd)
+            const playerNameElements = xpathNodes(
+                ".//*[contains(@class, 'sc-hnpbor') and contains(@class, 'joqxXd')]",
+                teamContainer
+            );
+
+            // For each player, get name and find the associated odds
+            for (const nameEl of playerNameElements) {
+                const playerName = nameEl.textContent.trim();
+                if (!playerName) continue;
+
+                // Navigate up to the player block (parent container holding both name and odds)
+                // The player name sits inside a structure like:
+                // sc-fQZEtd.kuoGCN (player block)
+                //   sc-gsWfJX.dneboB (name section)
+                //     sc-joEDEW.bsioaW (name wrapper)
+                //       sc-dhKgxO (name inner)
+                //         sc-hnpbor.joqxXd (player name text)
+                //   sc-iPRpaO (odds container)
+                //     sc-dTyONn (odds columns wrapper)
+                //       bet-group-outcome-odd (3 of these, one per column)
+                let playerBlock = document.evaluate(
+                    "./ancestor::div[contains(@class, 'sc-fQZEtd') or contains(@class, 'kuoGCN')]",
+                    nameEl, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
+                ).singleNodeValue || nameEl.parentNode;
+
+                // Verify if the found player block actually contains the odd buttons
+                const hasOdds = playerBlock ? document.evaluate(
+                    ".//div[starts-with(@data-testid, 'odd-button-')]",
+                    playerBlock, null, XPathResult.BOOLEAN_TYPE, null
+                ).booleanValue : false;
+
+                // If that failed or block doesn't have odds, walk up until we find a container that has odds
+                if (!playerBlock || !hasOdds) {
+                    let cur = nameEl.parentNode;
+                    while (cur && cur !== teamContainer) {
+                        const curHasOdds = document.evaluate(
+                            ".//div[starts-with(@data-testid, 'odd-button-')]",
+                            cur, null, XPathResult.BOOLEAN_TYPE, null
+                        ).booleanValue;
+                        if (curHasOdds) {
+                            playerBlock = cur;
+                            break;
+                        }
+                        cur = cur.parentNode;
+                    }
+                }
+                if (!playerBlock) continue;
+
+                // Find the odds wrapper that contains the 3 columns (sc-dTyONn or lhSHLt)
+                const oddsWrapper = document.evaluate(
+                    ".//div[contains(@class, 'sc-dTyONn') or contains(@class, 'lhSHLt')]",
+                    playerBlock, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
+                ).singleNodeValue || playerBlock;
+
+                // Extract odds in order (they should match columnHeaders order)
+                const oddButtons = xpathNodes(
+                    ".//div[starts-with(@data-testid, 'odd-button-')]",
+                    oddsWrapper
+                );
+
+                const playerOdds = [];
+                for (const btn of oddButtons) {
+                    const valueSpan = document.evaluate(
+                        ".//span[contains(@class, 'odd-button-value')]",
+                        btn, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
+                    ).singleNodeValue;
+                    if (valueSpan) {
+                        playerOdds.push(valueSpan.textContent.trim().replace(',', '.'));
+                    }
+                }
+
+                // Format output: use column headers if we have them
+                const oddFormattedParts = [];
+                for (let i = 0; i < playerOdds.length; i++) {
+                    const colName = (i < columnHeaders.length) ? columnHeaders[i] : `Col${i+1}`;
+                    oddFormattedParts.push(`${colName}: ${playerOdds[i]}`);
+                }
+
+                if (oddFormattedParts.length > 0) {
+                    sectionOdds.push(`  ${playerName} | ${oddFormattedParts.join(' | ')}`);
+                }
+            }
+
+        }
+
+        // Now rebuild the output with team separation
+        // We need to map which players belong to which team
+        const outputLines = [];
+        let playerIndex = 0;
+        for (const teamContainer of teamContainers) {
+            const teamNameEl = document.evaluate(
+                ".//*[contains(@class, 'sc-fUnMCh')]",
+                teamContainer, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
+            ).singleNodeValue;
+            const teamName = teamNameEl ? teamNameEl.textContent.trim() : '';
+            const playerCount = xpathNodes(
+                ".//*[contains(@class, 'sc-hnpbor') and contains(@class, 'joqxXd')]",
+                teamContainer
+            ).length;
+
+            if (playerCount > 0 && teamName) {
+                outputLines.push(`=== ${teamName} ===`);
+            }
+
+            for (let i = 0; i < playerCount && playerIndex < sectionOdds.length; i++) {
+                outputLines.push(sectionOdds[playerIndex]);
+                playerIndex++;
+            }
+        }
+
+        if (outputLines.length === 0) return null;
+        return { title, odds: outputLines };
     }
 
     // Extract odds from a section: expand it, then extract, return {title, odds[]} or null
@@ -435,6 +592,16 @@ async function copyToClipboard(text) {
 
         // Expand the section
         await expandSection(sectionContainer);
+
+        // Detect if this is a player-market section (e.g., "Joueur décisif")
+        // These have a bet-group-template layout with team sub-sections and columns
+        if (isPlayerMarketSection(sectionContainer)) {
+            // Wait a moment after expansion for DOM to settle
+            await sleep(300);
+            const playerData = await extractPlayerMarketOdds(sectionContainer, title);
+            if (playerData) return playerData;
+            // Fall through to standard extraction if player mode fails
+        }
 
         // Extract odds from this section
         const oddsButtons = xpathNodes(".//div[starts-with(@data-testid, 'odd-button-')]", sectionContainer);
@@ -485,7 +652,10 @@ async function copyToClipboard(text) {
 
             // Strategy 4: Ultimate text-walking fallback inside row wrapper
             if (!name) {
-                const rowWrapper = btn.closest("[class*='krYRTo']") || btn.parentNode?.parentNode;
+                const rowWrapper = document.evaluate(
+                    "./ancestor::div[contains(@class, 'krYRTo')]",
+                    btn, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
+                ).singleNodeValue || btn.parentNode?.parentNode;
                 if (rowWrapper) {
                     const textNodes = [];
                     const walker = document.createTreeWalker(rowWrapper, NodeFilter.SHOW_TEXT);
@@ -566,25 +736,16 @@ async function copyToClipboard(text) {
         return { title, odds: sectionOdds };
     }
 
-    async function extractAllOddsFromMatchVb() {
+    async function extractAllOddsFromMatch() {
         try {
-            showProgress('🔍 Expanding sections while scrolling...');
+            showProgress('🔍 Scanning sections while scrolling...');
             
-            // Find the scrollable container
             const scrollable = findScrollableContainer();
-
-            // Process sections incrementally while scrolling down
             const allResults = [];
-            const processedHeadings = new WeakSet();  // Track actual DOM elements, not position-based keys
-            const headingKeywords = [
-                'Vainqueur', 'Score exact', 'Nombre de points', 'Écart de points',
-                'Nombre de sets', 'Écart de sets', 'Nombre exact de sets',
-                'Y aura-t-il', 'remporte au moins', 'Nombre de points de'
-            ];
+            const processedButtons = new WeakSet();
 
-            let prevScrollTop = -1;
-            let noNewSectionsCount = 0;
-            const MAX_NO_NEW = 15;
+            // Ensure all currently visible sections have their "Extract" button injected
+            injectSectionExtractButtons();
 
             // Start from top
             if (scrollable === window) {
@@ -594,27 +755,32 @@ async function copyToClipboard(text) {
             }
             await sleep(300);
 
+            let prevScrollTop = -1;
+            let noNewSectionsCount = 0;
+            const MAX_NO_NEW = 15;
+
             while (noNewSectionsCount < MAX_NO_NEW) {
-                // Find all currently visible sections with headings
+                // Ensure all sections currently in the DOM have "Extract" buttons injected
+                injectSectionExtractButtons();
+
+                // Find injected "Extract" buttons that we haven't processed yet
+                const extractBtns = document.querySelectorAll('[data-section-extract="true"]');
                 let foundNew = false;
-                for (const kw of headingKeywords) {
-                    const headings = xpathNodes(`//div[contains(text(),'${kw}')]`);
-                    for (const h of headings) {
-                        const rect = h.getBoundingClientRect();
-                        const isVisible = rect.top < (window.innerHeight + 200) && rect.bottom > -200;
-                        if (!isVisible) continue;
 
-                        // Deduplicate by tracking the actual DOM element using WeakSet
-                        if (processedHeadings.has(h)) continue;
-                        processedHeadings.add(h);
+                for (const btn of extractBtns) {
+                    if (processedButtons.has(btn)) continue;
 
-                        const data = await extractSectionData(h);
-                        if (data) {
-                            allResults.push(data.title);
-                            allResults.push(...data.odds);
-                            allResults.push('');
-                            foundNew = true;
-                        }
+                    const headingEl = btn.parentNode;
+                    if (!headingEl || !headingEl.dataset.originalTitle) continue;
+
+                    processedButtons.add(btn);
+
+                    const data = await extractSectionData(headingEl);
+                    if (data) {
+                        allResults.push(data.title);
+                        allResults.push(...data.odds);
+                        allResults.push('');
+                        foundNew = true;
                     }
                 }
 
@@ -651,7 +817,6 @@ async function copyToClipboard(text) {
             if (allResults.length === 0) throw new Error("No odds extracted from any section");
 
             const output = allResults.join('\n');
-            lastExtractedData = output;
             await copyToClipboard(output);
             const oddCount = output.split('\n').filter(line => line.includes(':')).length;
             const sectionCount = output.split('\n').filter(line => line !== '' && !line.includes(':')).length;
@@ -662,7 +827,7 @@ async function copyToClipboard(text) {
         }
     }
 
-    // --- Sports page extraction (upcoming singles matches) --------------
+    // --- Sports page extraction (upcoming singles) ----------------------
     const dayIndicators = ['demain', 'sam', 'dim', 'lun', 'mar', 'mer', 'jeu', 'ven'];
     function isDayIndicator(text) {
         const lower = text.toLowerCase();
@@ -870,7 +1035,7 @@ async function copyToClipboard(text) {
             });
 
             if (!extractedMatches.length) {
-                showProgress('⚠️ No upcoming tennis singles matches found', true);
+                showProgress('⚠️ No upcoming singles matches found', true);
                 actionBtn.disabled = false;
                 actionBtn.style.opacity = '1';
                 actionBtn.style.cursor = 'pointer';
@@ -903,7 +1068,6 @@ async function copyToClipboard(text) {
         actionBtn = null;
         if (progressTimeout) clearTimeout(progressTimeout);
         currentMode = null;
-        lastExtractedData = '';
         extractedMatches = [];
         sportsLimitSelectorDiv = null;
         sportsLimitBtns = [];
@@ -917,7 +1081,7 @@ async function copyToClipboard(text) {
         if (uiContainer) return;
 
         uiContainer = document.createElement('div');
-        uiContainer.id = 'winamax-tennis-ui';
+        uiContainer.id = 'winamax-tools-ui';
         uiContainer.style.cssText = `
             position: fixed;
             bottom: 20px;
@@ -946,9 +1110,6 @@ async function copyToClipboard(text) {
             display: none;
             white-space: nowrap;
         `;
-
-        updateProgressTheme();
-        window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', updateProgressTheme);
 
         actionBtn = document.createElement('button');
         actionBtn.style.cssText = `
@@ -1001,17 +1162,28 @@ async function copyToClipboard(text) {
             const btn = document.createElement('button');
             btn.textContent = l.label;
             btn.dataset.limit = l.key;
+            btn.style.cssText = `
+                background: linear-gradient(135deg, #1e6df2, #0a4bc2);
+                border: none;
+                color: white;
+                font-size: 10px;
+                font-weight: 700;
+                padding: 2px 12px;
+                border-radius: 12px;
+                cursor: pointer;
+                font-family: inherit;
+                letter-spacing: 0.3px;
+                transition: all 0.2s ease;
+                white-space: nowrap;
+                line-height: normal;
+            `;
             btn.addEventListener('mouseenter', () => {
-                const isActive = (btn.dataset.limit === 'true') === sportsScanLimit;
-                if (!isActive) {
-                    btn.style.background = 'rgba(255, 255, 255, 0.25)';
-                }
+                btn.style.transform = 'scale(1.08)';
+                btn.style.boxShadow = '0 2px 8px rgba(0,0,0,0.3)';
             });
             btn.addEventListener('mouseleave', () => {
-                const isActive = (btn.dataset.limit === 'true') === sportsScanLimit;
-                if (!isActive) {
-                    btn.style.background = 'rgba(255, 255, 255, 0.15)';
-                }
+                btn.style.transform = 'scale(1)';
+                btn.style.boxShadow = 'none';
             });
             btn.addEventListener('click', () => {
                 sportsScanLimit = btn.dataset.limit === 'true';
@@ -1028,17 +1200,18 @@ async function copyToClipboard(text) {
     function updateSportsLimitButtons() {
         sportsLimitBtns.forEach(btn => {
             const isActive = (btn.dataset.limit === 'true') === sportsScanLimit;
-            btn.style.background = isActive ? 'linear-gradient(135deg, #1e6df2, #0a4bc2)' : 'rgba(255, 255, 255, 0.15)';
-            btn.style.color = isActive ? 'white' : 'rgba(255, 255, 255, 0.7)';
-            btn.style.border = isActive ? '1px solid rgba(255,255,255,0.4)' : '1px solid rgba(255,255,255,0.15)';
-            btn.style.fontWeight = isActive ? '700' : '500';
+            btn.style.background = isActive ? 'linear-gradient(135deg, #1e6df2, #0a4bc2)' : 'rgba(255, 255, 255, 0.1)';
+            btn.style.color = isActive ? 'white' : 'rgba(255, 255, 255, 0.6)';
+            btn.style.border = isActive ? '1px solid rgba(255,255,255,0.3)' : '1px solid rgba(255,255,255,0.08)';
+            btn.style.fontWeight = isActive ? '700' : '400';
+            btn.style.boxShadow = isActive ? '0 2px 8px rgba(0,0,0,0.25)' : 'none';
         });
     }
 
     function createMatchUI() {
         createBaseUI();
         
-        actionBtn.textContent = '🎾 Extract all odds';
+        actionBtn.textContent = 'Extract all odds';
         
         actionBtn.onclick = async () => {
             if (actionBtn.disabled) return;
@@ -1048,7 +1221,7 @@ async function copyToClipboard(text) {
             actionBtn.style.opacity = '0.7';
             actionBtn.style.cursor = 'wait';
             
-            await extractAllOddsFromMatchVb();
+            await extractAllOddsFromMatch();
             
             actionBtn.disabled = false;
             actionBtn.style.opacity = '1';
@@ -1068,7 +1241,7 @@ async function copyToClipboard(text) {
     function createSportsUI() {
         createBaseUI();
         createSportsLimitSelector();
-        actionBtn.textContent = '🎾 Extract Matches';
+        actionBtn.textContent = 'Extract Matches';
         actionBtn.onclick = () => handleSportsExtract();
         currentMode = 'sports';
     }

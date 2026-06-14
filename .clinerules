@@ -1,15 +1,15 @@
 ---
-description: Comprehensive guidelines, coding standards, and workflows for maintaining and developing the Winamax Tennis & Volleyball Tools userscript.
-author: Cline
-version: 1.0
+description: Comprehensive guidelines, coding standards, and workflows for maintaining and developing the Winamax Tools userscript.
+author: me
+version: 1.1
 category: "Project Rules"
 tags: ["tampermonkey", "userscript", "xpath", "vanilla-js", "ui-ux"]
 globs: ["script.js", "**/*.js"]
 ---
 
-# Winamax Tennis & Volleyball Tools Development Rules
+# Winamax Tools Development Rules
 
-This document defines the core principles, coding standards, UI/UX guidelines, and testing workflows for the Winamax Tennis & Volleyball Tools userscript. All modifications and additions to the codebase MUST adhere to these rules.
+This document defines the core principles, coding standards, UI/UX guidelines, and testing workflows for the Winamax Tools userscript. All modifications and additions to the codebase MUST adhere to these rules.
 
 ---
 
@@ -121,92 +121,23 @@ const btn = await waitForXPath("//div[contains(text(),'Plus de sélections')]");
 await sleep(500);
 ```
 
-## 9. Code Architecture & Global Logic
+## 9. Code Quality & Dead Code Prevention
 
-### Page Modes & Routing
-* **Match Mode (`https://www.winamax.fr/paris-sportifs/match/*`):**
-  * **All:** Extracts ALL odds from all visible sections by scrolling and expanding collapsed headers (originally designed for Volleyball, now available as a general option).
-  * **Total Games:** Extracts "Total Games" (Over/Under) odds.
-  * **Games Spread:** Extracts "Games Spread" (Handicaps) odds.
-* **Sports Mode (`https://www.winamax.fr/paris-sportifs/sports/5`):**
-  * Scans the live/upcoming tennis singles matches list, scrolls dynamically, and extracts match metadata (players, tournament, round, match time, day indicator).
+Maintaining a clean, efficient codebase is critical for long-term maintainability.
 
-### Global State Variables
-* `uiContainer`: UI container element.
-* `progressDiv`: Progress/notification element.
-* `actionBtn`: Primary action button (Extract).
-* `progressTimeout`: Timeout for progress auto-fade.
-* `currentMode`: `'match'` | `'sports'` | `null` (Set by `getPageMode()` based on URL).
-* `lastExtractedData`: Stores last extracted data for match mode.
-* `extractedMatches`: Stores extracted matches for sports mode.
-* `oddsMode`: `'all'` | `'over'` | `'under'` (Filters Tennis Total Games).
-* `modeSelectorDiv`: Mode toggle UI container.
-* `sectionType`: `'All'` | `'Total Games'` | `'Games Spread'` (Match mode sub-selection).
-* `sectionSelectorDiv`: Section toggle UI container.
-* `spreadFilter`: `'all'` | `'player1'` | `'player2'` (Filters Tennis handicaps).
-* `spreadFilterDiv`: Spread filter UI container.
-* `spreadPlayer1Name`: Detected player 1 name.
-* `spreadPlayer2Name`: Detected player 2 name.
-* `modeBtns`: Store mode button references.
-* `sectionBtns`: Store section button references.
-* `filterBtns`: Store filter button references.
-* `sportsScanLimit`: `true` | `false` (If `true`, stops Sports scanning when a night gap is detected).
-* `sportsLimitSelectorDiv`: Sports range toggle UI container.
-* `sportsLimitBtns`: Store sports limit button references.
-
-### Core Execution Flows
-1. **Initialization:** `watchForNavigation()` detects URL changes, calls `checkAndUpdateUI()` to inject/remove the floating panel.
-2. **UI Rendering:** `checkAndUpdateUI()` calls `createMatchUI()` or `createSportsUI()` based on the detected page mode.
-   * `createMatchUI()` builds the base UI, section selector, mode selector, and spread filter selector, and pre-populates player names.
-   * `createSportsUI()` builds the base UI and sports limit selector.
-3. **Extraction & Copy:** Clicking the primary action button triggers the respective extraction function based on `sectionType` (in Match mode) or `handleSportsExtract` (in Sports mode):
-   * If `sectionType === 'All'`: calls `extractAllOddsFromMatchVb()`.
-   * If `sectionType === 'Total Games'`: calls `extractOddsFromMatch()`.
-   * If `sectionType === 'Games Spread'`: calls `extractSpreadOddsFromMatch()`.
-   * In Sports mode: calls `handleSportsExtract()`.
-   Shows visual feedback and copies the formatted string to the clipboard.
-
-### Expected Clipboard Formats
-* **Tennis Total Games:** `[Over/Under] [Line] jeux : [Odd]` (e.g., `Over 22.5 jeux : 1.85`), sorted by odd value ascending within Over and Under groups, and filtered by `oddsMode`.
-* **Tennis Spread:** `[Player 1] [Spread] : [Odd 1] | [Player 2] [Spread] : [Odd 2]` (e.g., `Player1 +2.5 : 1.80 | Player2 -2.5 : 1.90`), grouped by handicap absolute value, sorted numerically, and filtered by `spreadFilter`.
-* **All Odds (originally Volleyball):** Structured text block containing section titles and their respective odds (e.g., `[Section Title]\n[Selection Name] : [Odd]`).
-* **Sports Page:** List of matches formatted as `[Player 1] vs [Player 2] ([Tournament] - [Round])` (one per line).
+### Rules:
+* **No Dead Variables:** Variables that are declared, assigned, but never read elsewhere MUST be removed. If a variable is only written to and never consumed, it wastes memory and confuses readers.
+* **No Empty Blocks:** Empty `if`, `else`, `for`, or `while` blocks (blocks with only comments and no executable statements) MUST be removed or replaced with actual logic.
+* **Consistent Indentation:** All code inside the IIFE MUST use consistent 4-space indentation. No function or block should use 0-space or mixed indentation.
+* **State Cleanup on Teardown:** When removing UI (`removeUI`), all state variables specific to the page mode must be reset to their defaults to prevent cross-mode pollution.
+* **Comment Accuracy:** Code comments must accurately describe what the code does. Stale or misleading comments are as harmful as dead code.
 
 ---
 
-## 10. Testing Workflow
+## 10. Code Architecture & Global Logic
 
-### Playwright Test Command
-To test the extension across all supported browsers (Chromium, Firefox, WebKit), run:
-
-```bash
-npx playwright test tests/winamax.spec.ts --headed
-```
-
-This command:
-1. Creates a temporary Chrome extension from `script.js` with Manifest V3
-2. Launches each browser (Chromium, Firefox, WebKit) in headed mode
-3. Injects the userscript directly for Firefox/WebKit compatibility
-4. Navigates to Winamax Tennis page, selects a match, and tests extraction
-5. Mocks clipboard operations to verify extracted odds format
-6. Cleans up temporary extension files after completion
-
-### Test Coverage
-The test verifies:
-- Extension loads and UI injects correctly on Winamax
-- "Total Games" extraction (Over/Under odds with "jeux :" format)
-- "Games Spread" extraction (Handicap odds for both players)
-- Cross-browser compatibility (Chromium via extension, Firefox/WebKit via direct injection)
-- Clipboard copy functionality via mocked `navigator.clipboard.writeText` and `GM_setClipboard`
-
-### Running Single Browser Tests
-```bash
-# Chromium only (uses --load-extension)
-npx playwright test tests/winamax.spec.ts --headed --project=chromium
-
-# Firefox only (uses direct script injection)
-npx playwright test tests/winamax.spec.ts --headed --project=firefox
-
-# WebKit only (uses direct script injection)
-npx playwright test tests/winamax.spec.ts --headed --project=webkit
-```
+### Page Modes & Routing
+* **Match Mode (`https://www.winamax.fr/paris-sportifs/match/*`):**
+  * **All:** Extracts ALL odds from all visible sections by scrolling and expanding collapsed headers.
+* **Sports Mode (`https://www.winamax.fr/paris-sportifs/sports/5`):**
+  * Scans the live/upcoming tennis singles matches list, scrolls dynamically, and extracts match metadata (players, tournament, round, match time, day indicator).
