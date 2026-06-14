@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Winamax Tools
-// @version      9.14
+// @version      9.15
 // @description  Extracts betting odds from Winamax.
 // @match        https://www.winamax.fr/*
 // @updateURL    https://raw.githubusercontent.com/anthony-rm/useful-tool/main/script.js
@@ -244,10 +244,10 @@
                 background: linear-gradient(135deg, #1e6df2, #0a4bc2);
                 border: none;
                 color: white;
-                font-size: 10px;
+                font-size: 12px;
                 font-weight: 700;
-                padding: 2px 10px;
-                border-radius: 12px;
+                padding: 4px 14px;
+                border-radius: 14px;
                 cursor: pointer;
                 font-family: inherit;
                 letter-spacing: 0.3px;
