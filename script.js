@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Winamax Tools
-// @version      9.15
+// @version      9.21
 // @description  Extracts betting odds from Winamax.
 // @match        https://www.winamax.fr/*
 // @updateURL    https://raw.githubusercontent.com/anthony-rm/useful-tool/main/script.js
@@ -123,118 +123,86 @@
 
     // --- Per-section extract button injection ----------------------------
 
+    // Determines if an element is a valid section heading
+    function isSectionHeading(span) {
+        // Get the title text from the child div
+        const childDiv = span.querySelector && span.querySelector(':scope > div');
+        const title = ((childDiv && childDiv.textContent) || span.textContent || '').trim();
+
+        // Filter: title must be 2-40 chars
+        if (!title || title.length < 2 || title.length > 40) return false;
+
+        // Filter: skip pure numbers, percentages, short codes
+        if (/^\d+([.,]\d+)?%?$/.test(title)) return false;
+
+        // Filter: skip common UI text
+        if (/^(Extract|Plus de|Moins de|Titulaire|Nouveau|NEW|\?)/i.test(title)) return false;
+
+        // Filter: skip if it looks like a player name (First Last) with no section context
+        // Section titles are typically single words or short phrases
+        if (/^[A-Z][a-z]+\s[A-Z][a-z]+$/.test(title) && 
+            !/(Résultat|Double chance|Buteur|Buteurs|Score|Nombre|Écart|Total|Match|Vainqueur|Mi-temps|Buts|Tirs|Joueur|Serial)/i.test(title)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    // Determines if a heading element is associated with odds content
+    function hasAssociatedOdds(headingEl) {
+        // Navigate up to find section container
+        let node = headingEl.parentNode;
+        while (node && node !== document.body) {
+            const hasOdds = document.evaluate(
+                ".//div[starts-with(@data-testid, 'odd-button-')]", 
+                node, 
+                null, 
+                XPathResult.BOOLEAN_TYPE, 
+                null
+            ).booleanValue;
+            if (hasOdds) return true;
+            node = node.parentNode;
+        }
+        return false;
+    }
+
     // Find all section headings and inject a blue "Extract" button next to each
     function injectSectionExtractButtons() {
         if (!processedSectionHeadings) {
             processedSectionHeadings = new WeakSet();
         }
 
-            // Generic approach: find ALL section heading divs inside the odds list area.
-        // We match the pattern used by Winamax: a div with class "sc-MyySi" that
-        // contains the section title AND is inside a virtualized list container.
-        // As a fallback, we also look for any div with data-original-title
-        // (Winamax stores tooltip titles there), or any div inside the heading
-        // area that contains text and sits above an odds section.
-
-        // Strategy 1: Match heading divs with the known Winamax class "sc-MyySi"
-        //            that also have data-original-title (tooltip).
-        // Strategy 2: Match divs with data-original-title anywhere in the odds area.
-        // Strategy 3: Match the inner text div (class "caruXb") inside sc-MyySi.
-
-        const headingSelectors = [
-            // Primary: divs with data-original-title inside the odds list section
-            ".//div[@data-original-title]",
-            // Fallback: the classic heading containers with known "caruXb" class
-            ".//div[contains(@class, 'caruXb')]",
-        ];
-
-        // Use the middleColumn or the virtualized grid as the context for searching
+        // Find the main content container
         const context = document.evaluate(
             "//*[@data-testid='middleColumn'] | //*[contains(@class, 'ReactVirtualized__Grid')]",
             document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
         ).singleNodeValue || document;
 
-        let allHeadings = new Set();
-
-        for (const sel of headingSelectors) {
-            const nodes = xpathNodes(sel, context);
-            for (const h of nodes) {
-                // Skip empty or very short text
-                const text = (h.getAttribute('data-original-title') || h.textContent).trim();
-                if (!text || text.length < 2) continue;
-
-                // Skip if this is actually the "Extract" button itself or contains one
-                if (h.dataset.sectionExtract === 'true') continue;
-                const hasBtn = document.evaluate(".//*[@data-section-extract='true']", h, null, XPathResult.BOOLEAN_TYPE, null).booleanValue;
-                if (hasBtn) continue;
-
-                // Skip if child of a heading we already captured (avoid duplicates)
-                let isDuplicate = false;
-                for (const existing of allHeadings) {
-                    if (existing === h || existing.contains(h) || h.contains(existing)) {
-                        // Prefer the one with data-original-title, or the outer one
-                        if (existing.getAttribute('data-original-title') && !h.getAttribute('data-original-title')) {
-                            isDuplicate = true;
-                            break;
-                        }
-                        if (h.contains(existing) && !existing.getAttribute('data-original-title')) {
-                            // h is outer, existing is inner without tooltip — replace with h
-                            allHeadings.delete(existing);
-                            allHeadings.add(h);
-                            isDuplicate = true;
-                            break;
-                        }
-                        if (existing.contains(h)) {
-                            isDuplicate = true;
-                            break;
-                        }
-                    }
-                }
-                if (!isDuplicate) allHeadings.add(h);
-            }
-        }
-
-        // Deduplicate: if both a parent div and its child div are captured,
-        // keep the one that has data-original-title, or the outermost one
+        // Collect all candidate heading spans
+        const allSpans = xpathNodes(".//span[div[not(*)]]", context);
         const finalHeadings = [];
-        for (const h of allHeadings) {
-            let dominated = false;
-            for (const other of allHeadings) {
-                if (other === h) continue;
-                if (other.contains(h) && other.getAttribute('data-original-title')) {
-                    dominated = true;
-                    break;
-                }
-            }
-            if (!dominated) finalHeadings.push(h);
+        
+        // Filter valid section headings using the new helper functions
+        for (const span of allSpans) {
+            if (!isSectionHeading(span)) continue;
+            if (!hasAssociatedOdds(span)) continue;
+            
+            // Skip if already has a button
+            if (span.dataset && span.dataset.sectionExtract === 'true') continue;
+            if (document.evaluate(
+                ".//*[@data-section-extract='true']", span, null, XPathResult.BOOLEAN_TYPE, null
+            ).booleanValue) continue;
+
+            finalHeadings.push(span);
         }
 
         for (const h of finalHeadings) {
-            // Skip if we already added a button to this heading
             if (processedSectionHeadings.has(h)) continue;
-
-            // Verify this heading actually has odds in its parent section container
-            let hasOdds = false;
-            let node = h.parentNode;
-            while (node && node !== document.body) {
-                const oddsCheck = document.evaluate(
-                    ".//div[starts-with(@data-testid, 'odd-button-')]",
-                    node, null, XPathResult.BOOLEAN_TYPE, null
-                ).booleanValue;
-                if (oddsCheck) { hasOdds = true; break; }
-                node = node.parentNode;
-            }
-            if (!hasOdds) continue;
-
-            // Mark as processed
             processedSectionHeadings.add(h);
 
-            // Store original title text before adding the button (so extractSectionData
-            // doesn't accidentally pick up the button's textContent e.g. "⏳")
-            // Prefer the data-original-title attribute if it exists (Winamax tooltip),
-            // otherwise fall back to textContent trimmed of the "Extract" button text.
-            const attrTitle = h.getAttribute('data-original-title');
-            h.dataset.originalTitle = (attrTitle && attrTitle.trim()) || h.textContent.trim();
+            const childDiv = h.querySelector && h.querySelector(':scope > div');
+            const headingText = ((childDiv && childDiv.textContent) || h.textContent || '').trim();
+            h.dataset.originalTitle = headingText;
 
             // Create the extract button (compact, blue gradient like the main button)
             const btn = document.createElement('button');
@@ -279,9 +247,22 @@
                 try {
                     const data = await extractSectionData(h);
                     if (data && data.odds.length > 0) {
-                        const output = data.title + '\n' + data.odds.join('\n');
+                        // Add section title as the first line
+                        let output = data.title + '\n';
+                        
+                        // Add odds with proper indentation
+                        for (const line of data.odds) {
+                            // Skip empty lines at the beginning
+                            if (output === data.title + '\n' && line.trim() === '') continue;
+                            output += line + '\n';
+                        }
+                        
+                        // Remove trailing newlines
+                        output = output.replace(/\n+$/, '');
+                        
                         await copyToClipboard(output);
-                        showProgress(`✅ ${data.odds.length} odds from "${data.title}" copied!`);
+                        const oddCount = data.odds.filter(line => line.includes(':')).length;
+                        showProgress(`✅ ${oddCount} odds from "${data.title}" copied!`);
                     } else {
                         showProgress('⚠️ No odds found in section', true);
                     }
@@ -372,12 +353,12 @@
         const currentOdds = xpathNodes(".//div[starts-with(@data-testid, 'odd-button-')]", sectionContainer);
         
         // If <= 2 odds, the section is in compact grid view.
-        // Click the toggle (dcSvAA div with the 4-rect icon) to switch to list view.
+        // Click the toggle (div/button with the 4-rect icon) to switch to list view.
         if (currentOdds.length <= 2) {
-            // Find the tabs-wrapper and click the toggle with class containing "dcSvAA"
+            // Find the tabs-wrapper and click the toggle containing the layout SVG icon
             const tabsWrapper = document.evaluate(".//*[contains(@class, 'tabs-wrapper')]", sectionContainer, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
             if (tabsWrapper) {
-                const toggleDiv = document.evaluate(".//*[contains(@class, 'dcSvAA')]", tabsWrapper, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                const toggleDiv = document.evaluate(".//*[local-name()='svg']/parent::*", tabsWrapper, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
                 if (toggleDiv && toggleDiv.click) {
                     toggleDiv.click();
                     await sleep(500);
@@ -410,38 +391,118 @@
 
     // Detect if a section is a player-market section (e.g., "Joueur décisif") with 
     // team sub-sections and column categories (Buteur/Passeur/Décisif).
+    // IMPORTANT: A standard 1X2 market (like "Résultat") also uses bet-group-template
+    // but does NOT have team sub-sections with player names. We must distinguish them.
+    // A true player-market section has:
+    //   - bet-group-template with team containers that each contain player names
+    //   - OR column headers (Buteur/Passeur/etc.)
     function isPlayerMarketSection(sectionContainer) {
-        return document.evaluate(
+        // First check: does it have bet-group-template at all?
+        const hasBetGroupTemplate = document.evaluate(
             ".//*[contains(@class, 'bet-group-template')]",
             sectionContainer, null, XPathResult.BOOLEAN_TYPE, null
         ).booleanValue;
+        if (!hasBetGroupTemplate) return false;
+
+        // Check for column headers (Buteur/Passeur/Décisif) — definitive player market indicator
+        const headerRow = document.evaluate(
+            ".//*[contains(@class, 'bet-group-template')]/*[1][self::div or self::header]",
+            sectionContainer, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
+        ).singleNodeValue;
+        if (headerRow) {
+            const headerCells = xpathNodes(".//p", headerRow);
+            if (headerCells.length > 0) {
+                const headerTexts = headerCells.map(c => c.textContent.trim());
+                // Check for known column header patterns
+                const hasColumnHeaders = headerTexts.some(h => 
+                    /buteur|passeur|décisif|but|passe/i.test(h)
+                );
+                if (hasColumnHeaders) return true;
+            }
+        }
+
+        // Check for team containers with player names inside bet-group-template
+        const teamContainers = xpathNodes(
+            ".//*[contains(@class, 'bet-group-template')]/div",
+            sectionContainer
+        );
+        if (teamContainers.length >= 2) {
+            // Multiple team containers with player-like names (First Last pattern)
+            let teamsWithPlayers = 0;
+            for (const tc of teamContainers) {
+                const hasPlayerName = document.evaluate(
+                    ".//*[self::p or self::span or self::div][string-length(normalize-space(text())) > 3 and contains(text(), ' ') and not(contains(text(), ':')) and not(contains(text(), 'ATP')) and not(contains(text(), 'WTA')) and not(contains(text(), 'Plus de')) and not(contains(text(), 'Moins de')) and not(contains(text(), 'Extract'))]",
+                    tc, null, XPathResult.BOOLEAN_TYPE, null
+                ).booleanValue;
+                if (hasPlayerName) teamsWithPlayers++;
+            }
+            // If 2+ team containers have player names, it's a player market
+            if (teamsWithPlayers >= 2) return true;
+        }
+
+        // Default: not a player market (e.g., standard 1X2 like "Résultat")
+        return false;
+    }
+
+    // Special extraction for "Double chance" sections
+    function extractDoubleChanceOdds(sectionContainer, title) {
+        const outcomes = [];
+        
+        // Find all outcome title elements
+        const outcomeTitles = xpathNodes(
+            ".//div[contains(@class, 'bet-group-outcome-title')]//div[contains(@class, 'label-text')]",
+            sectionContainer
+        );
+        
+        for (const titleEl of outcomeTitles) {
+            const label = titleEl.textContent.trim();
+            if (!label) continue;
+            
+            // Find the corresponding odds value
+            let oddsValue = '';
+            let current = titleEl;
+            while (current && current !== sectionContainer) {
+                const oddsEl = document.evaluate(
+                    ".//span[contains(@class, 'odd-button-value')]",
+                    current.parentNode,
+                    null,
+                    XPathResult.FIRST_ORDERED_NODE_TYPE,
+                    null
+                ).singleNodeValue;
+                
+                if (oddsEl) {
+                    oddsValue = oddsEl.textContent.trim().replace(',', '.');
+                    break;
+                }
+                current = current.parentNode;
+            }
+            
+            if (label && oddsValue) {
+                outcomes.push(`${label} : ${oddsValue}`);
+            }
+        }
+        
+        if (outcomes.length === 0) return null;
+        return {
+            title: title,
+            odds: outcomes
+        };
     }
 
     // Extract odds from player-market sections where each team has players
     // and odds are in columns (e.g., Buteur/Passeur/Décisif).
-    // Expected structure:
-    //   bet-group-template → sc-cKNVVb (container) → sc-feUZmu (team header + rows)
-    //   Team name: sc-fUnMCh element
-    //   Player blocks: sc-fQZEtd (one per player) with name in sc-hnpbor.joqxXd
-    //   Odds for each player: sc-iPRpaO > sc-dTyONn > .bet-group-outcome-odd (3 columns)
     async function extractPlayerMarketOdds(sectionContainer, title) {
-        const sectionOdds = [];
-
-        // Get all team sub-containers: each .sc-cKNVVb is a team block
-        // (Inside bet-group-template, there are two .sc-cKNVVb containers:
-        //  one for each team.)
+        // Find team-split containers (direct child divs of bet-group-template)
         const teamContainers = xpathNodes(
-            ".//*[contains(@class, 'bet-group-template')]/*[contains(@class, 'sc-cKNVVb')]",
+            ".//*[contains(@class, 'bet-group-template')]/div",
             sectionContainer
         );
 
-        if (teamContainers.length === 0) return null;
-
-        // Extract column headers from the bet-group-template header row
-        // Look for the header row (sc-eKvyHJ or similar) containing column names
+        // Extract column header from the bet-group-template header row, if present
         let columnHeaders = [];
+        // Find header row using more resilient XPath
         const headerRow = document.evaluate(
-            ".//*[contains(@class, 'bet-group-template')]/*[contains(@class, 'sc-eKvyHJ')]",
+            ".//*[contains(@class, 'bet-group-template')]/*[1][self::div or self::header]",
             sectionContainer, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
         ).singleNodeValue;
         if (headerRow) {
@@ -449,125 +510,195 @@
             columnHeaders = headerCells.map(c => c.textContent.trim());
         }
 
-        for (const teamContainer of teamContainers) {
-            // Find team name: look for the team flag name element (sc-fUnMCh)
-            const teamNameEl = document.evaluate(
-                ".//*[contains(@class, 'sc-fUnMCh')]",
-                teamContainer, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
-            ).singleNodeValue;
-            const teamName = teamNameEl ? teamNameEl.textContent.trim() : '';
+        // --- Helper: collect all odds for a single player block ----------
+        // Collects from ALL threshold wrappers inside the block (e.g. "paliers" sections
 
-            // Find player blocks: each player has a name + 3 odds
-            // Player blocks are divs that contain a player name and have odds as children
-            // They are directly inside the sc-cKNVVb container after the team header
-            // Strategy: find all elements containing player names (sc-hnpbor.joqxXd)
-            const playerNameElements = xpathNodes(
-                ".//*[contains(@class, 'sc-hnpbor') and contains(@class, 'joqxXd')]",
-                teamContainer
+        function collectPlayerOdds(playerBlock) {
+            // Find odds wrappers by their relationship to odd buttons
+            const oddsWrappers = xpathNodes(
+                ".//div[.//div[starts-with(@data-testid, 'odd-button-')]]",
+                playerBlock
             );
 
-            // For each player, get name and find the associated odds
-            for (const nameEl of playerNameElements) {
-                const playerName = nameEl.textContent.trim();
-                if (!playerName) continue;
-
-                // Navigate up to the player block (parent container holding both name and odds)
-                // The player name sits inside a structure like:
-                // sc-fQZEtd.kuoGCN (player block)
-                //   sc-gsWfJX.dneboB (name section)
-                //     sc-joEDEW.bsioaW (name wrapper)
-                //       sc-dhKgxO (name inner)
-                //         sc-hnpbor.joqxXd (player name text)
-                //   sc-iPRpaO (odds container)
-                //     sc-dTyONn (odds columns wrapper)
-                //       bet-group-outcome-odd (3 of these, one per column)
-                let playerBlock = document.evaluate(
-                    "./ancestor::div[contains(@class, 'sc-fQZEtd') or contains(@class, 'kuoGCN')]",
-                    nameEl, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
-                ).singleNodeValue || nameEl.parentNode;
-
-                // Verify if the found player block actually contains the odd buttons
-                const hasOdds = playerBlock ? document.evaluate(
-                    ".//div[starts-with(@data-testid, 'odd-button-')]",
-                    playerBlock, null, XPathResult.BOOLEAN_TYPE, null
-                ).booleanValue : false;
-
-                // If that failed or block doesn't have odds, walk up until we find a container that has odds
-                if (!playerBlock || !hasOdds) {
-                    let cur = nameEl.parentNode;
-                    while (cur && cur !== teamContainer) {
-                        const curHasOdds = document.evaluate(
-                            ".//div[starts-with(@data-testid, 'odd-button-')]",
-                            cur, null, XPathResult.BOOLEAN_TYPE, null
-                        ).booleanValue;
-                        if (curHasOdds) {
-                            playerBlock = cur;
-                            break;
-                        }
-                        cur = cur.parentNode;
-                    }
-                }
-                if (!playerBlock) continue;
-
-                // Find the odds wrapper that contains the 3 columns (sc-dTyONn or lhSHLt)
-                const oddsWrapper = document.evaluate(
-                    ".//div[contains(@class, 'sc-dTyONn') or contains(@class, 'lhSHLt')]",
-                    playerBlock, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
-                ).singleNodeValue || playerBlock;
-
-                // Extract odds in order (they should match columnHeaders order)
+            // If we have column headers from a header row, treat this as a
+            // column-based market: take only the first wrapper (3 columns).
+            if (columnHeaders.length > 0) {
+                const wrapper = oddsWrappers.length > 0 ? oddsWrappers[0] : playerBlock;
                 const oddButtons = xpathNodes(
                     ".//div[starts-with(@data-testid, 'odd-button-')]",
-                    oddsWrapper
+                    wrapper
                 );
+                const values = [];
+                for (const btn of oddButtons) {
+                    const span = document.evaluate(
+                        ".//span[contains(@class, 'odd-button-value')]",
+                        btn, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
+                    ).singleNodeValue;
+                    if (span) values.push(span.textContent.trim().replace(',', '.'));
+                }
+                const parts = values.map((v, i) => {
+                    const colName = (i < columnHeaders.length) ? columnHeaders[i] : `Col${i+1}`;
+                    return `${colName}: ${v}`;
+                });
+                return parts.length > 0 ? parts.join(' | ') : '';
+            }
 
-                const playerOdds = [];
+            // No column headers → this is a threshold/paliers market with multiple wrappers.
+            // Collect ALL odds from ALL wrappers, prefixing each with its outcome name.
+            const allOdds = [];
+            for (const wrapper of oddsWrappers) {
+                const oddButtons = xpathNodes(
+                    ".//div[starts-with(@data-testid, 'odd-button-')]",
+                    wrapper
+                );
                 for (const btn of oddButtons) {
                     const valueSpan = document.evaluate(
                         ".//span[contains(@class, 'odd-button-value')]",
                         btn, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
                     ).singleNodeValue;
-                    if (valueSpan) {
-                        playerOdds.push(valueSpan.textContent.trim().replace(',', '.'));
+                    if (!valueSpan) continue;
+                    const oddValue = valueSpan.textContent.trim().replace(',', '.');
+
+                    // Get outcome name (e.g. "Plus de 9,5") – Strategy 1: sibling
+                    let outcomeName = '';
+                    const valueContainer = valueSpan.parentElement;
+                    if (valueContainer && valueContainer.previousElementSibling) {
+                        outcomeName = valueContainer.previousElementSibling.textContent.trim();
+                    }
+                    // Strategy 2: Look for common title/name div/span classes inside the button itself
+                    if (!outcomeName) {
+                        const nameDiv = document.evaluate(
+                            ".//*[contains(@class, 'odd-button-name') or contains(@class, 'outcome-name')]",
+                            btn, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
+                        ).singleNodeValue;
+                        if (nameDiv) outcomeName = nameDiv.textContent.trim();
+                    }
+
+                    if (outcomeName && oddValue) {
+                        allOdds.push(`${outcomeName} : ${oddValue}`);
                     }
                 }
-
-                // Format output: use column headers if we have them
-                const oddFormattedParts = [];
-                for (let i = 0; i < playerOdds.length; i++) {
-                    const colName = (i < columnHeaders.length) ? columnHeaders[i] : `Col${i+1}`;
-                    oddFormattedParts.push(`${colName}: ${playerOdds[i]}`);
-                }
-
-                if (oddFormattedParts.length > 0) {
-                    sectionOdds.push(`  ${playerName} | ${oddFormattedParts.join(' | ')}`);
-                }
             }
-
+            return allOdds.join(' | ');
         }
 
-        // Now rebuild the output with team separation
-        // We need to map which players belong to which team
-        const outputLines = [];
-        let playerIndex = 0;
-        for (const teamContainer of teamContainers) {
-            const teamNameEl = document.evaluate(
-                ".//*[contains(@class, 'sc-fUnMCh')]",
-                teamContainer, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
-            ).singleNodeValue;
-            const teamName = teamNameEl ? teamNameEl.textContent.trim() : '';
-            const playerCount = xpathNodes(
-                ".//*[contains(@class, 'sc-hnpbor') and contains(@class, 'joqxXd')]",
-                teamContainer
-            ).length;
+        // --- Helper: find the player block DOM node containing a player name element
+        function findPlayerBlock(nameEl, boundary) {
+            // Walk up the DOM tree to find a container that has both the player name and odds buttons
+            let cur = nameEl.parentNode;
+            while (cur && cur !== boundary) {
+                if (document.evaluate(
+                    ".//div[starts-with(@data-testid, 'odd-button-')]",
+                    cur, null, XPathResult.BOOLEAN_TYPE, null
+                ).booleanValue) return cur;
+                cur = cur.parentNode;
+            }
+            return nameEl.parentNode;
+        }
 
-            if (playerCount > 0 && teamName) {
-                outputLines.push(`=== ${teamName} ===`);
+        // --- Case 1: Team-split format (e.g. "Joueur décisif") -------------
+        if (teamContainers.length > 0) {
+            const sectionOdds = [];
+            for (const teamContainer of teamContainers) {
+                // Team name: find the first text element that looks like a team name
+                // within the team container (direct child of bet-group-template)
+                const teamNameEl = document.evaluate(
+                    ".//*[self::p or self::span or self::div][string-length(normalize-space(text())) > 1 and not(contains(text(), 'Plus de sélections')) and not(contains(text(), 'paliers')) and not(contains(text(), 'ATP')) and not(contains(text(), 'WTA'))]",
+                    teamContainer, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
+                ).singleNodeValue;
+                const teamName = teamNameEl ? teamNameEl.textContent.trim() : '';
+
+                // Player names: find text elements that look like player names
+                // (capitalized, not tournament/round/time indicators)
+                const playerNameElements = xpathNodes(
+                    ".//*[self::p or self::span or self::div][string-length(normalize-space(text())) > 1 and contains(text(), ' ') and not(contains(text(), ':')) and not(contains(text(), 'ATP')) and not(contains(text(), 'WTA')) and not(contains(text(), 'Plus de')) and not(contains(text(), 'Moins de'))]",
+                    teamContainer
+                );
+
+                for (const nameEl of playerNameElements) {
+                    const playerName = nameEl.textContent.trim();
+                    if (!playerName) continue;
+                    const playerBlock = findPlayerBlock(nameEl, teamContainer);
+                    if (!playerBlock) continue;
+                    const oddsStr = collectPlayerOdds(playerBlock);
+                    if (oddsStr) {
+                        sectionOdds.push(`  ${playerName} | ${oddsStr}`);
+                    }
+                }
             }
 
-            for (let i = 0; i < playerCount && playerIndex < sectionOdds.length; i++) {
-                outputLines.push(sectionOdds[playerIndex]);
-                playerIndex++;
+            // Rebuild with team separation
+            const outputLines = [];
+            // If there's exactly 1 container with no team name, skip team header
+            const isSingleUntitledContainer = teamContainers.length === 1 &&
+                !document.evaluate(
+                    ".//*[self::p or self::span or self::div][string-length(normalize-space(text())) > 1 and not(contains(text(), 'Plus de sélections')) and not(contains(text(), 'paliers')) and not(contains(text(), 'ATP')) and not(contains(text(), 'WTA'))]",
+                    teamContainers[0], null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
+                ).singleNodeValue;
+
+            if (isSingleUntitledContainer) {
+                // Direct player output (no team header)
+                for (const item of sectionOdds) {
+                    outputLines.push(item);
+                }
+            } else {
+                // Standard team-split output
+                let playerIndex = 0;
+                for (const teamContainer of teamContainers) {
+                    const teamNameEl = document.evaluate(
+                        ".//*[self::p or self::span or self::div][string-length(normalize-space(text())) > 1 and not(contains(text(), 'Plus de sélections')) and not(contains(text(), 'paliers')) and not(contains(text(), 'ATP')) and not(contains(text(), 'WTA'))]",
+                        teamContainer, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
+                    ).singleNodeValue;
+                    const teamName = teamNameEl ? teamNameEl.textContent.trim() : '';
+                    const playerCount = xpathNodes(
+                        ".//*[self::p or self::span or self::div][string-length(normalize-space(text())) > 1 and contains(text(), ' ') and not(contains(text(), ':')) and not(contains(text(), 'ATP')) and not(contains(text(), 'WTA')) and not(contains(text(), 'Plus de')) and not(contains(text(), 'Moins de'))]",
+                        teamContainer
+                    ).length;
+                    if (playerCount > 0 && teamName) {
+                        outputLines.push(`=== ${teamName} ===`);
+                    }
+                    for (let i = 0; i < playerCount && playerIndex < sectionOdds.length; i++) {
+                        outputLines.push(sectionOdds[playerIndex]);
+                        playerIndex++;
+                    }
+                }
+            }
+            if (outputLines.length > 0) return { title, odds: outputLines };
+            return null;
+        }
+
+        // --- Case 2: Direct player blocks inside bet-group-template ---------
+        // (e.g. "Nombre de points du joueur (paliers)" — no team split)
+        // Find player blocks: they are descendants of bet-group-template that contain both
+        // a player name (text with space, capitalized) and odds buttons
+        const candidateBlocks = xpathNodes(
+            ".//*[contains(@class, 'bet-group-template')]//*[.//div[starts-with(@data-testid, 'odd-button-')]]",
+            sectionContainer
+        );
+        const playerBlocks = [];
+        for (const block of candidateBlocks) {
+            // Check if this block contains a player name (text with space, not containing special chars)
+            const hasPlayerName = document.evaluate(
+                ".//*[self::p or self::span or self::div][string-length(normalize-space(text())) > 1 and contains(text(), ' ') and not(contains(text(), ':')) and not(contains(text(), 'ATP')) and not(contains(text(), 'WTA')) and not(contains(text(), 'Plus de')) and not(contains(text(), 'Moins de'))]",
+                block, null, XPathResult.BOOLEAN_TYPE, null
+            ).booleanValue;
+            if (hasPlayerName) {
+                playerBlocks.push(block);
+            }
+        }
+        if (playerBlocks.length === 0) return null;
+
+        const outputLines = [];
+        for (const playerBlock of playerBlocks) {
+            const playerNameEl = document.evaluate(
+                ".//*[self::p or self::span or self::div][string-length(normalize-space(text())) > 1 and contains(text(), ' ') and not(contains(text(), ':')) and not(contains(text(), 'ATP')) and not(contains(text(), 'WTA')) and not(contains(text(), 'Plus de')) and not(contains(text(), 'Moins de'))]",
+                playerBlock, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
+            ).singleNodeValue;
+            const playerName = playerNameEl ? playerNameEl.textContent.trim() : '';
+            if (!playerName) continue;
+            const oddsStr = collectPlayerOdds(playerBlock);
+            if (oddsStr) {
+                outputLines.push(`  ${playerName} | ${oddsStr}`);
             }
         }
 
@@ -590,12 +721,79 @@
         }
         if (!sectionContainer) return null;
 
+        // Helper to find sub-group title for an odd button using resilient DOM traversal
+        function findGroupTitle(btn, sectionTitle, sectionContainer) {
+            let current = btn.parentNode;
+            while (current && current !== sectionContainer) {
+                // If this container doesn't hold multiple odd buttons, it's likely just a single cell layout,
+                // and any text is just the outcome label, not a sub-group header.
+                const oddButtonsInCurrent = current.querySelectorAll('[data-testid^="odd-button-"]');
+                if (oddButtonsInCurrent.length <= 1) {
+                    current = current.parentNode;
+                    continue;
+                }
+
+                const walker = document.createTreeWalker(current, NodeFilter.SHOW_TEXT);
+                const candidates = [];
+                while (walker.nextNode()) {
+                    const text = walker.currentNode.textContent.trim();
+                    if (!text) continue;
+                    
+                    // Ignore if the text is inside an odd button or represents odds/percentages
+                    let isInsideBtnOrNoise = false;
+                    let node = walker.currentNode.parentNode;
+                    while (node && node !== current) {
+                        if (node.dataset && node.dataset.testid && node.dataset.testid.startsWith('odd-button-')) {
+                            isInsideBtnOrNoise = true;
+                            break;
+                        }
+                        // Skip if the parent class suggests it's an odds value or distribution
+                        const className = node.className || '';
+                        if (typeof className === 'string' && (
+                            className.includes('odd-button-value') || 
+                            className.includes('percent-distribution') ||
+                            className.includes('completeness')
+                        )) {
+                            isInsideBtnOrNoise = true;
+                            break;
+                        }
+                        node = node.parentNode;
+                    }
+                    
+                    if (isInsideBtnOrNoise) continue;
+                    
+                    // Filter out standard option names and values
+                    if (text === 'Oui' || text === 'Non' || text === '1' || text === 'N' || text === '2') continue;
+                    if (/^\d+([.,]\d+)?%?$/.test(text)) continue; // numbers or percentages
+                    if (text.toLowerCase() === sectionTitle.toLowerCase()) continue;
+                    if (/^(Extract|Plus de|Moins de|Titulaire|Nouveau|NEW|\?)/i.test(text)) continue;
+                    
+                    candidates.push(text);
+                }
+                
+                if (candidates.length > 0) {
+                    return candidates[0];
+                }
+                current = current.parentNode;
+            }
+            return '';
+        }
+
         // Expand the section
         await expandSection(sectionContainer);
 
+        // Special handling for "Double chance" sections
+        if (title.toLowerCase().includes('chance')) {
+            await sleep(300); // Wait for expansion to complete
+            const oddsData = extractDoubleChanceOdds(sectionContainer, title);
+            if (oddsData) return oddsData;
+        }
+
         // Detect if this is a player-market section (e.g., "Joueur décisif")
         // These have a bet-group-template layout with team sub-sections and columns
-        if (isPlayerMarketSection(sectionContainer)) {
+        // BUT exclude "Score exact" sections which also use bet-group-template but have score outcomes (1-0, 2-0, etc.)
+        const isScoreExact = title.toLowerCase().includes('score exact');
+        if (!isScoreExact && isPlayerMarketSection(sectionContainer)) {
             // Wait a moment after expansion for DOM to settle
             await sleep(300);
             const playerData = await extractPlayerMarketOdds(sectionContainer, title);
@@ -625,7 +823,7 @@
             // Strategy 2: Look for common title/name div classes inside the button itself
             if (!name) {
                 const possibleNameDiv = document.evaluate(
-                    ".//*[contains(@class, 'fZKtql') or contains(@class, 'odd-button-name') or contains(@class, 'outcome-name')]",
+                    ".//*[contains(@class, 'odd-button-name') or contains(@class, 'outcome-name')]",
                     btn, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
                 ).singleNodeValue;
                 if (possibleNameDiv) name = possibleNameDiv.textContent.trim();
@@ -643,7 +841,9 @@
                         current, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
                     ).singleNodeValue;
                     if (labelNode) {
-                        name = labelNode.textContent.trim();
+                        // Clean label: remove trailing percentage (e.g. "21%") and distribution text
+                        const text = labelNode.textContent.trim();
+                        name = text.replace(/\s*\d+([.,]\d+)?%$/, '').trim();
                         break;
                     }
                     current = current.parentNode;
@@ -651,12 +851,20 @@
             }
 
             // Strategy 4: Ultimate text-walking fallback inside row wrapper
+            // Find the row wrapper by looking for a common ancestor that contains
+            // both the odd button and other text nodes (outcome name, etc.)
             if (!name) {
-                const rowWrapper = document.evaluate(
-                    "./ancestor::div[contains(@class, 'krYRTo')]",
-                    btn, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
-                ).singleNodeValue || btn.parentNode?.parentNode;
-                if (rowWrapper) {
+                // Walk up to find a container that has the button and other text content
+                let rowWrapper = btn.parentNode;
+                for (let depth = 0; depth < 6 && rowWrapper && rowWrapper !== sectionContainer; depth++) {
+                    const textCount = document.evaluate(
+                        "count(.//text()[normalize-space(.) != ''])",
+                        rowWrapper, null, XPathResult.NUMBER_TYPE, null
+                    ).numberValue;
+                    if (textCount > 2) break; // Found a wrapper with multiple text nodes
+                    rowWrapper = rowWrapper.parentNode;
+                }
+                if (rowWrapper && rowWrapper !== sectionContainer) {
                     const textNodes = [];
                     const walker = document.createTreeWalker(rowWrapper, NodeFilter.SHOW_TEXT);
                     while (walker.nextNode()) {
@@ -673,7 +881,8 @@
             }
 
             if (name && oddValue) {
-                rawOdds.push({ name, value: oddValue.replace(',', '.') });
+                const groupTitle = findGroupTitle(btn, title, sectionContainer);
+                rawOdds.push({ name, value: oddValue.replace(',', '.'), groupTitle });
             }
         }
 
@@ -726,9 +935,22 @@
                 }
             }
         } else {
-            // Non-spread section: keep original order
+            // General section: group by groupTitle (preserving order)
+            const groups = new Map();
             for (const o of rawOdds) {
-                sectionOdds.push(`${o.name} : ${o.value}`);
+                if (!groups.has(o.groupTitle)) {
+                    groups.set(o.groupTitle, []);
+                }
+                groups.get(o.groupTitle).push(o);
+            }
+            
+            for (const [groupTitle, groupOdds] of groups.entries()) {
+                if (groupTitle) {
+                    sectionOdds.push(groupTitle);
+                }
+                for (const o of groupOdds) {
+                    sectionOdds.push(`${o.name} : ${o.value}`);
+                }
             }
         }
 

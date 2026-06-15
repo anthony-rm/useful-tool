@@ -9,7 +9,7 @@ globs: ["script.js", "**/*.js"]
 
 # Winamax Tools Development Rules
 
-This document defines the core principles, coding standards, UI/UX guidelines, and testing workflows for the Winamax Tools userscript. All modifications and additions to the codebase MUST adhere to these rules.
+This document defines the core principles, coding standards, UI/UX guidelines for the Winamax Tools userscript. All modifications and additions to the codebase MUST adhere to these rules.
 
 ---
 
@@ -30,7 +30,6 @@ The metadata block at the top of `script.js` is critical for the userscript's ex
 ### Rules:
 * **Preserve Header:** NEVER delete, corrupt, or accidentally modify the `// ==UserScript==` and `// ==/UserScript==` boundaries.
 * **Version Control:** You MUST increment the `@version` (e.g., `9.1` -> `9.2`) whenever making functional changes, bug fixes, or feature additions.
-* **Permissions:** Do NOT add new `@grant` rules unless absolutely necessary for new functionality, and always document why.
 * **Match Patterns:** Ensure `@match` patterns remain restricted to `https://www.winamax.fr/*` to respect user privacy and security.
 
 ---
@@ -40,12 +39,10 @@ The metadata block at the top of `script.js` is critical for the userscript's ex
 Since Winamax uses a dynamic, single-page application (SPA) framework with compiled/minified class names, DOM querying must be extremely resilient.
 
 ### Rules:
-* **Use Helpers:** ALWAYS prefer the existing helper functions `xpathNodes(xpath, context)` and `waitForXPath(xpath, timeout, context)` over raw `document.evaluate` calls.
-* **Resilient XPaths:** Avoid using absolute XPaths or relying on fragile, auto-generated CSS class names (e.g., `hukOGC`, `fZKtql`). Instead, use:
-  * Text content matching: `//div[contains(text(), 'Nombre de jeux')]`
+* **Use Helpers:** ALWAYS use the existing helper functions `xpathNodes(xpath, context)` and `waitForXPath(xpath, timeout, context)`.
+* **Resilient XPaths:** Don't rely on fragile, auto-generated CSS class names (e.g., `hukOGC`, `fZKtql`). Instead, use:
   * Test IDs: `//*[starts-with(@data-testid, 'odd-button-')]`
   * Relative relationships: Finding a stable heading and navigating to its parent/ancestor container.
-* **Fallback Mechanisms:** If a minified class name MUST be used as a last resort, always implement a robust fallback (e.g., checking multiple possible classes or structure-based navigation) and document it with comments.
 
 ---
 
@@ -54,9 +51,6 @@ Since Winamax uses a dynamic, single-page application (SPA) framework with compi
 The userscript injects a floating control panel into the Winamax interface. It must look professional, feel native, and not interfere with the website's usability.
 
 ### Rules:
-* **Dynamic Theme Support:** The UI MUST support both light and dark modes dynamically.
-  * Use `window.matchMedia('(prefers-color-scheme: dark)')` to detect the system theme.
-  * Update colors, backgrounds, and borders dynamically when the system theme changes.
 * **Visual Feedback & States:**
   * Buttons MUST have clear hover effects (e.g., subtle scale up, shadow changes).
   * During asynchronous operations (like scanning or extracting), buttons MUST be disabled, show a loading state (e.g., `⏳ Scanning...`), and change the cursor to `wait`.
@@ -79,7 +73,7 @@ The script is used across different browsers (Chrome, Firefox, Safari) and users
 
 ## 6. Performance & Infinite Scroll Handling
 
-Volleyball extraction and sports page scanning require scrolling and processing large amounts of dynamic DOM elements.
+Extracting all odds/matches on match/sports pages scanning require scrolling and processing large amounts of dynamic DOM elements.
 
 ### Rules:
 * **Asynchronous Delays:** ALWAYS include appropriate `sleep(ms)` delays when simulating scrolls or waiting for elements to load. This prevents browser UI freezing and avoids triggering rate-limits.
@@ -99,27 +93,6 @@ Before proposing or finalizing any changes, follow this verification protocol:
 4. **User Instructions:** When presenting changes, provide clear instructions on how the user can copy the code into Tampermonkey and test it on the live Winamax site.
 
 ---
-
-## 8. Code Patterns to Avoid vs. Use
-
-### ❌ NEVER DO THIS:
-```javascript
-// Fragile XPath relying on exact minified class names
-const btn = document.evaluate("//div[@class='hukOGC']", document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-
-// Blocking synchronous sleep
-const start = Date.now();
-while (Date.now() - start < 1000) {}
-```
-
-### ✅ ALWAYS DO THIS:
-```javascript
-// Resilient XPath using text content and helper
-const btn = await waitForXPath("//div[contains(text(),'Plus de sélections')]");
-
-// Non-blocking asynchronous sleep
-await sleep(500);
-```
 
 ## 9. Code Quality & Dead Code Prevention
 
