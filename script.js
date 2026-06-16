@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Winamax Tools
-// @version      9.21
+// @version      9.27
 // @description  Extracts betting odds from Winamax.
 // @match        https://www.winamax.fr/*
 // @updateURL    https://raw.githubusercontent.com/anthony-rm/useful-tool/main/script.js
@@ -80,6 +80,42 @@
             observer.observe(context === document ? document.body : context, { childList: true, subtree: true });
             setTimeout(() => { observer.disconnect(); reject(new Error(`Timeout XPath: ${xpath}`)); }, timeout);
         });
+    }
+
+    // --- Player name extraction from match page header -------------------
+    // Retrieves the two player names from the middleColumn header using resilient XPath.
+    // Returns an array of two strings [player1, player2] or null if not found.
+    function getMiddleColumnPlayers() {
+        const middleColumn = document.evaluate(
+            "//*[@data-testid='middleColumn']",
+            document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
+        ).singleNodeValue;
+        if (!middleColumn) return null;
+
+        // Player names are in divs that contain text with a space (First Last pattern),
+        // located within the match header area (the first section of middleColumn).
+        // We find the match-route-anchor area and look for player name divs near it.
+        // The structure has: tournament/round info at top, then player blocks side by side,
+        // then time, then odds buttons.
+
+        // Strategy: Find all leaf divs in the upper portion of middleColumn that look like names
+        // (two or more capitalized words, not containing ATP/WWTA/digits/colons)
+        const playerDivs = xpathNodes(
+            ".//div[string-length(normalize-space(text())) > 2 and contains(text(), ' ') and not(contains(text(), ':')) and not(contains(text(), 'ATP')) and not(contains(text(), 'WTA')) and not(contains(text(), '1/')) and not(contains(text(), 'Extract')) and not(starts-with(normalize-space(text()), '€')) and not(contains(text(), '€'))]",
+            middleColumn
+        );
+
+        const players = [];
+        for (const div of playerDivs) {
+            const name = div.textContent.trim();
+            // Must look like a name: starts with uppercase letter, has a space, no digits
+            if (name && /^[A-ZÀ-ÖØ-ÿ]/.test(name) && !/^\d/.test(name) && !players.includes(name)) {
+                players.push(name.split(' ').at(-1));
+                if (players.length >= 2) break;
+            }
+        }
+
+        return players.length >= 2 ? players : null;
     }
 
     // --- Page detection -------------------------------------------------
@@ -204,38 +240,21 @@
             const headingText = ((childDiv && childDiv.textContent) || h.textContent || '').trim();
             h.dataset.originalTitle = headingText;
 
-            // Create the extract button (compact, blue gradient like the main button)
-            const btn = document.createElement('button');
-            btn.textContent = 'Extract';
-            btn.dataset.sectionExtract = 'true';
-            btn.style.cssText = `
-                background: linear-gradient(135deg, #1e6df2, #0a4bc2);
-                border: none;
-                color: white;
-                font-size: 12px;
-                font-weight: 700;
-                padding: 4px 14px;
-                border-radius: 14px;
-                cursor: pointer;
-                font-family: inherit;
-                letter-spacing: 0.3px;
-                transition: all 0.2s ease;
-                white-space: nowrap;
-                flex-shrink: 0;
-                margin-left: 8px;
-                line-height: normal;
-            `;
+            // Determine section type:
+            // - "Nombre de jeux" -> Over/Under filtering (threshold-based)
+            // - "Écart de jeux" -> Player-based filtering (Player 1 / Player 2)
+            const isNombreDeJeuxSection = headingText.includes('Nombre de jeux');
+            const isEcartDeJeuxSection = headingText.includes('Écart de jeux');
+            const isOverUnderSection = isNombreDeJeuxSection || isEcartDeJeuxSection;
 
-            btn.addEventListener('mouseenter', () => {
-                btn.style.transform = 'scale(1.08)';
-                btn.style.boxShadow = '0 2px 8px rgba(0,0,0,0.3)';
-            });
-            btn.addEventListener('mouseleave', () => {
-                btn.style.transform = 'scale(1)';
-                btn.style.boxShadow = 'none';
-            });
+            // Retrieve player names from the match page header (middleColumn) using resilient XPath
+            const playerNames = getMiddleColumnPlayers();
+            // If we found player names, use them; otherwise fall back to generic labels
+            const p1Name = (playerNames && playerNames.length >= 2) ? playerNames[0] : 'Player 1';
+            const p2Name = (playerNames && playerNames.length >= 2) ? playerNames[1] : 'Player 2';
 
-            btn.addEventListener('click', async (e) => {
+            // Shared click handler for section extract buttons
+            async function handleSectionExtractClick(e, btn, filter) {
                 e.stopPropagation();
                 if (btn.disabled) return;
                 btn.disabled = true;
@@ -245,7 +264,7 @@
                 btn.style.cursor = 'wait';
 
                 try {
-                    const data = await extractSectionData(h);
+                    const data = await extractSectionData(h, filter);
                     if (data && data.odds.length > 0) {
                         // Add section title as the first line
                         let output = data.title + '\n';
@@ -262,7 +281,13 @@
                         
                         await copyToClipboard(output);
                         const oddCount = data.odds.filter(line => line.includes(':')).length;
-                        showProgress(`✅ ${oddCount} odds from "${data.title}" copied!`);
+                        let filterLabel = '';
+                        if (isNombreDeJeuxSection) {
+                            filterLabel = filter === 'over' ? ' Over' : filter === 'under' ? ' Under' : '';
+                        } else if (isEcartDeJeuxSection) {
+                            filterLabel = filter === p1Name ? ` ${p1Name}` : filter === p2Name ? ` ${p2Name}` : '';
+                        }
+                        showProgress(`✅ ${oddCount} odds from "${data.title}"${filterLabel} copied!`);
                     } else {
                         showProgress('⚠️ No odds found in section', true);
                     }
@@ -275,18 +300,83 @@
                 btn.textContent = originalText;
                 btn.style.opacity = '1';
                 btn.style.cursor = 'pointer';
-            });
+            }
 
-            // Make the heading a flex container so the button sits inline
+            // Helper to create a stylized section button
+            function createSectionBtn(label, datasetKey) {
+                const btn = document.createElement('button');
+                btn.textContent = label;
+                btn.dataset[datasetKey] = 'true';
+                btn.style.cssText = `
+                    background: linear-gradient(135deg, #1e6df2, #0a4bc2);
+                    border: none;
+                    color: white;
+                    font-size: 12px;
+                    font-weight: 700;
+                    padding: 4px 14px;
+                    border-radius: 14px;
+                    cursor: pointer;
+                    font-family: inherit;
+                    letter-spacing: 0.3px;
+                    transition: all 0.2s ease;
+                    white-space: nowrap;
+                    flex-shrink: 0;
+                    margin-left: 8px;
+                    line-height: normal;
+                `;
+
+                btn.addEventListener('mouseenter', () => {
+                    btn.style.transform = 'scale(1.08)';
+                    btn.style.boxShadow = '0 2px 8px rgba(0,0,0,0.3)';
+                });
+                btn.addEventListener('mouseleave', () => {
+                    btn.style.transform = 'scale(1)';
+                    btn.style.boxShadow = 'none';
+                });
+
+                return btn;
+            }
+
+            // Create the standard "Extract" button (all odds)
+            const extractBtn = createSectionBtn('Extract', 'sectionExtract');
+            extractBtn.addEventListener('click', async (e) => { await handleSectionExtractClick(e, extractBtn, null); });
+
+            // Make the heading a flex container so the buttons sit inline
             const computedDisplay = window.getComputedStyle(h).display;
             if (computedDisplay !== 'flex' && computedDisplay !== 'inline-flex') {
                 h.style.display = 'flex';
                 h.style.alignItems = 'center';
             }
-            // Ensure the heading can accommodate the button without overflow
+            // Ensure the heading can accommodate the buttons without overflow
             h.style.flexWrap = 'wrap';
 
-            h.appendChild(btn);
+            h.appendChild(extractBtn);
+
+            // For "Nombre de jeux" sections: add Over/Under buttons
+            if (isNombreDeJeuxSection) {
+                const overBtn = createSectionBtn('Over', 'sectionExtractOver');
+                overBtn.addEventListener('click', async (e) => { await handleSectionExtractClick(e, overBtn, 'over'); });
+                overBtn.style.background = 'linear-gradient(135deg, #28a745, #1e7e34)';
+                h.appendChild(overBtn);
+
+                const underBtn = createSectionBtn('Under', 'sectionExtractUnder');
+                underBtn.addEventListener('click', async (e) => { await handleSectionExtractClick(e, underBtn, 'under'); });
+                underBtn.style.background = 'linear-gradient(135deg, #dc3545, #b02a37)';
+                h.appendChild(underBtn);
+            }
+
+            // For "Écart de jeux" sections: add Player 1 / Player 2 buttons
+            if (isEcartDeJeuxSection) {
+                const player1Btn = createSectionBtn(p1Name, 'sectionExtractPlayer1');
+                player1Btn.addEventListener('click', async (e) => { await handleSectionExtractClick(e, player1Btn, p1Name); });
+                player1Btn.style.background = 'linear-gradient(135deg, #28a745, #1e7e34)';
+                h.appendChild(player1Btn);
+
+                const player2Btn = createSectionBtn(p2Name, 'sectionExtractPlayer2');
+                player2Btn.addEventListener('click', async (e) => { await handleSectionExtractClick(e, player2Btn, p2Name); });
+                player2Btn.style.background = 'linear-gradient(135deg, #dc3545, #b02a37)';
+                h.appendChild(player2Btn);
+            }
         }
     }
 
@@ -707,7 +797,8 @@
     }
 
     // Extract odds from a section: expand it, then extract, return {title, odds[]} or null
-    async function extractSectionData(headingEl) {
+    // Optional filter: 'over', 'under', player name string, or null for all odds
+    async function extractSectionData(headingEl, filter = null) {
         const title = headingEl.dataset.originalTitle || headingEl.textContent.trim();
         if (!title || title.length < 2) return null;
 
@@ -909,21 +1000,66 @@
         // Build final odds array
         const sectionOdds = [];
 
-        // "Nombre de jeux" sections: group by Over/Under sorted by odd value ascending
-        if (title.includes('Nombre de jeux')) {
+        // "Nombre de jeux" and "Écart de jeux" sections: group by Over/Under sorted by odd value ascending
+        if (title.includes('Nombre de jeux') || title.includes('Écart de jeux')) {
             const overOdds = rawOdds.filter(o => o.name.includes('Plus de'));
             const underOdds = rawOdds.filter(o => o.name.includes('Moins de'));
             const sortByValue = (a, b) => parseFloat(a.value) - parseFloat(b.value);
             overOdds.sort(sortByValue);
             underOdds.sort(sortByValue);
 
-            for (const o of overOdds) {
-                const threshold = o.name.replace('Plus de ', '');
-                sectionOdds.push(`Over ${threshold} jeux : ${o.value}`);
-            }
-            for (const o of underOdds) {
-                const threshold = o.name.replace('Moins de ', '');
-                sectionOdds.push(`Under ${threshold} jeux : ${o.value}`);
+            // Apply filter if provided
+            if (title.includes('Nombre de jeux')) {
+                // "Nombre de jeux": filter is 'over' or 'under'
+                if (filter === 'over') {
+                    for (const o of overOdds) {
+                        const threshold = o.name.replace('Plus de ', '');
+                        sectionOdds.push(`Over ${threshold} : ${o.value}`);
+                    }
+                } else if (filter === 'under') {
+                    for (const o of underOdds) {
+                        const threshold = o.name.replace('Moins de ', '');
+                        sectionOdds.push(`Under ${threshold} : ${o.value}`);
+                    }
+                } else {
+                    for (const o of overOdds) {
+                        const threshold = o.name.replace('Plus de ', '');
+                        sectionOdds.push(`Over ${threshold} jeux : ${o.value}`);
+                    }
+                    for (const o of underOdds) {
+                        const threshold = o.name.replace('Moins de ', '');
+                        sectionOdds.push(`Under ${threshold} jeux : ${o.value}`);
+                    }
+                }
+            } else if (title.includes('Écart de jeux')) {
+                // "Écart de jeux": group by player, sorted by odds value ascending (like Over/Under)
+                const playerNames = getMiddleColumnPlayers();
+                const p1 = playerNames && playerNames.length >= 2 ? playerNames[0] : null;
+                const p2 = playerNames && playerNames.length >= 2 ? playerNames[1] : null;
+
+                // Build player grouping from spread-format odds ("Player Name +/-N.N")
+                const ecartByPlayer = {};
+                for (const o of rawOdds) {
+                    const spreadMatch = o.name.match(spreadRegex);
+                    const playerNamePart = spreadMatch ? spreadMatch[1].trim() : o.name;
+                    if (!ecartByPlayer[playerNamePart]) ecartByPlayer[playerNamePart] = [];
+                    ecartByPlayer[playerNamePart].push(o);
+                }
+
+                // Determine which players to include based on filter
+                let playersToShow = Object.keys(ecartByPlayer);
+                if (filter && p1 && p2 && (filter === p1 || filter === p2)) {
+                    playersToShow = playersToShow.filter(p => p.includes(filter));
+                }
+                playersToShow.sort();
+
+                for (const player of playersToShow) {
+                    // Sort by odds value ascending
+                    ecartByPlayer[player].sort((a, b) => parseFloat(a.value) - parseFloat(b.value));
+                    for (const o of ecartByPlayer[player]) {
+                        sectionOdds.push(`${o.name} : ${o.value}`);
+                    }
+                }
             }
         } else if (spreadCount > rawOdds.length / 2) {
             // Spread-type section: group by player, sorted by handicap
