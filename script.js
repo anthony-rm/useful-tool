@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Winamax Tools
-// @version      9.27
+// @version      9.28
 // @description  Extracts betting odds from Winamax.
 // @match        https://www.winamax.fr/*
 // @updateURL    https://raw.githubusercontent.com/anthony-rm/useful-tool/main/script.js
@@ -266,13 +266,13 @@
                 try {
                     const data = await extractSectionData(h, filter);
                     if (data && data.odds.length > 0) {
-                        // Add section title as the first line
-                        let output = data.title + '\n';
+                        let output = '';
+                        if (!isNombreDeJeuxSection && !isEcartDeJeuxSection) {
+                            output = data.title + '\n';
+                        }
                         
-                        // Add odds with proper indentation
                         for (const line of data.odds) {
-                            // Skip empty lines at the beginning
-                            if (output === data.title + '\n' && line.trim() === '') continue;
+                            if (output === '' && line.trim() === '') continue;
                             output += line + '\n';
                         }
                         
@@ -1135,7 +1135,10 @@
 
                     const data = await extractSectionData(headingEl);
                     if (data) {
-                        allResults.push(data.title);
+                        const isOverUnderType = data.title.includes('Nombre de jeux') || data.title.includes('Écart de jeux');
+                        if (!isOverUnderType) {
+                            allResults.push(data.title);
+                        }
                         allResults.push(...data.odds);
                         allResults.push('');
                         foundNew = true;
