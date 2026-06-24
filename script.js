@@ -6,6 +6,7 @@
 // @updateURL    https://raw.githubusercontent.com/anthony-rm/useful-tool/main/script.js
 // @downloadURL  https://raw.githubusercontent.com/anthony-rm/useful-tool/main/script.js
 // @grant        GM_setClipboard
+// @grant        GM.setClipboard
 // ==/UserScript==
 
 (function() {
@@ -16,43 +17,52 @@
 
     // Cross-browser clipboard copy (compatible with Safari iOS, Safari Userscripts, Tampermonkey, etc.)
     async function copyToClipboard(text) {
-        // Method 1: Standard Web API
+        // Method 1: GM.setClipboard (GM4-style, async — works in Userscripts on Safari)
         try {
-            await navigator.clipboard.writeText(text);
-            return true;
-        } catch (err) {
-            console.log('Web Clipboard API failed, trying fallbacks...');
+            if (typeof GM !== 'undefined' && typeof GM.setClipboard !== 'undefined') {
+                await GM.setClipboard(text, 'text');
+                return true;
+            }
+        } catch (gmErr) {
+            console.log('GM.setClipboard failed, trying GM_setClipboard...');
         }
 
-        // Method 2: GM_setClipboard
+        // Method 2: GM_setClipboard (GM3-style, synchronous — Tampermonkey/Greasemonkey)
         try {
             if (typeof GM_setClipboard !== 'undefined') {
                 GM_setClipboard(text, 'text');
                 return true;
             }
         } catch (gmErr) {
-            console.log('GM_setClipboard failed, trying textarea method...');
+            console.log('GM_setClipboard failed, trying Web API...');
         }
 
-        // Method 3: Textarea method (for iOS Safari)
+        // Method 3: Standard Web API (requires recent user gesture)
+        try {
+            await navigator.clipboard.writeText(text);
+            return true;
+        } catch (err) {
+            console.log('Web Clipboard API failed, trying textarea method...');
+        }
+
+        // Method 4: Textarea method (for iOS Safari)
         try {
             const textarea = document.createElement('textarea');
             textarea.value = text;
-            textarea.style.position = 'fixed'; // Avoid scrolling to bottom
+            textarea.style.position = 'fixed';
             document.body.appendChild(textarea);
             textarea.select();
-            
-            // iOS requires this range selection
+
             const range = document.createRange();
             range.selectNodeContents(textarea);
             const selection = window.getSelection();
             selection.removeAllRanges();
             selection.addRange(range);
-            textarea.setSelectionRange(0, 999999); // For mobile devices
-            
+            textarea.setSelectionRange(0, 999999);
+
             const successful = document.execCommand('copy');
             document.body.removeChild(textarea);
-            
+
             if (successful) return true;
         } catch (err) {
             console.error('Textarea copy method failed:', err);
@@ -1219,16 +1229,7 @@
         let tournament = texts[tournamentIdx];
         tournament = tournament.replace(/\s+\d+(?:[.,]\d+)?$/, '').trim();
 
-        let round = '';
-        for (let i = tournamentIdx + 1; i < texts.length; i++) {
-            const t = texts[i];
-            if (!/^\d{1,2}:\d{2}$/.test(t) && !isDayIndicator(t) && t !== tournament && !t.includes('ATP') && !t.includes('WTA')) {
-                round = t;
-                break;
-            }
-        }
-
-        if (tournament.toLowerCase().includes('double') || round.toLowerCase().includes('double')) return null;
+        if (tournament.toLowerCase().includes('double')) return null;
 
         let timeIdx = -1;
         let dayIndicator = '';
@@ -1258,6 +1259,17 @@
         }
 
         if (!player1 || !player2 || player1 === player2) return null;
+
+        let round = '';
+        for (let i = tournamentIdx + 1; i < texts.length; i++) {
+            const t = texts[i];
+            if (/^\d{1,2}:\d{2}$/.test(t)) break;
+            if (looksLikePlayerName(t)) break;
+            if (!isDayIndicator(t) && t !== tournament && !t.includes('ATP') && !t.includes('WTA')) {
+                round = t;
+                break;
+            }
+        }
 
         return { tournament, round, player1, player2, matchTime, dayIndicator };
     }
@@ -1379,7 +1391,10 @@
     }
 
     function formatMatches(matches) {
-        return matches.map(m => `${m.player1} vs ${m.player2} (${m.tournament} - ${m.round})`).join('\n');
+        return matches.map(m => {
+            const suffix = m.round ? ` - ${m.round}` : '';
+            return `${m.player1} vs ${m.player2} (${m.tournament}${suffix})`;
+        }).join('\n');
     }
 
     async function handleSportsExtract() {
