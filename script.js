@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Winamax Tools
-// @version      9.28
-// @description  Extracts betting odds from Winamax.
+// @version      9.29
+// @description  Extracts betting odds from Winamax. GENERATED FILE: built from tennis_stats/core/winamax_core.js + src/ui.js (python tools/build_userscript.py) — edit those, not this one.
 // @match        https://www.winamax.fr/*
 // @updateURL    https://raw.githubusercontent.com/anthony-rm/useful-tool/main/script.js
 // @downloadURL  https://raw.githubusercontent.com/anthony-rm/useful-tool/main/script.js
@@ -12,9 +12,1060 @@
 (function() {
     'use strict';
 
+// ================= shared extraction core (winamax_core.js) =================
+/**
+ * winamax_core.js — shared, UI-free extraction core for Winamax.
+ *
+ * Single source of truth used by:
+ *   1. the Tampermonkey userscript (built into ~/Projets/cotes/useful-tool/script.js
+ *      by tennis_stats/tools/build_userscript.py — do not edit script.js by hand),
+ *   2. the tennis_stats Playwright driver (core/winamax.py injects this file and
+ *      calls the functions below through page.evaluate()).
+ *
+ * Rules:
+ *   - pure DOM/XPath over the rendered page, no network calls, no clipboard, no UI;
+ *   - every selector here is covered by tests/test_winamax_core.py fixtures;
+ *   - anything clipboard/UI-specific belongs in the userscript wrapper.
+ *
+ * Public API (window.WinamaxCore):
+ *   sleep, xpathNodes, findScrollableContainer,
+ *   matchPagePrefix, sportsPageUrl,
+ *   extractMatchInfo(card), extractCurrentMatches({includeLive}),
+ *   scanMatches({stopAtNightGap, includeLive, onProgress}) -> Promise<Match[]>,
+ *   formatMatches(matches) -> String,
+ *   getMiddleColumnPlayers(), isSectionHeading(span), hasAssociatedOdds(el),
+ *   findSectionHeadings(), extractSectionData(headingEl, filter) -> Promise<Section|null>,
+ *   formatSectionRow(row), formatSection(section), formatAllOddsText(odds),
+ *   extractOddsJSON({delayMs, onProgress}) -> Promise<OddsJSON>
+ *
+ * Match  = {matchId, url, tournament, round, player1, player2, matchTime,
+ *           dayIndicator, dayOffset, live, oddP1, oddP2, pctP1, pctP2}
+ * Row    = {t:'row',   label, value}          -> "label : value"
+ *        | {t:'group', label}                 -> "label"            (sub-group heading)
+ *        | {t:'team',  label}                 -> "=== label ==="    (player market team)
+ *        | {t:'player',label, cells:[{label, value, spaced}]}
+ *                                              -> "  label | c | c"
+ * Section= {title, rows, buttonCount}
+ * OddsJSON = {url, players, sections, sectionCount, oddCount, buttonCount}
+ */
+(function () {
+    'use strict';
+
     // --- Shared helpers -------------------------------------------------
     function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
+    function xpathNodes(xpath, context) {
+        if (!context) context = document;
+        const result = document.evaluate(xpath, context, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+        const nodes = [];
+        for (let i = 0; i < result.snapshotLength; i++) nodes.push(result.snapshotItem(i));
+        return nodes;
+    }
+
+    function xpathFirst(xpath, context) {
+        if (!context) context = document;
+        return document.evaluate(xpath, context, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+    }
+
+    function xpathBool(xpath, context) {
+        if (!context) context = document;
+        return document.evaluate(xpath, context, null, XPathResult.BOOLEAN_TYPE, null).booleanValue;
+    }
+
+    // --- Page containers ------------------------------------------------
+    const matchPagePrefix = 'https://www.winamax.fr/paris-sportifs/match/';
+    const sportsPageUrl = 'https://www.winamax.fr/paris-sportifs/sports/5';
+
+    function findScrollableContainer() {
+        const grid = xpathFirst("//*[contains(concat(' ', normalize-space(@class), ' '), ' ReactVirtualized__Grid ')]");
+        if (!grid) return window;
+        let el = grid.parentElement;
+        while (el && el !== document.body) {
+            const style = getComputedStyle(el);
+            if ((style.overflowY === 'auto' || style.overflowY === 'scroll') && el.scrollHeight > el.clientHeight) return el;
+            el = el.parentElement;
+        }
+        return window;
+    }
+
+    function scrollTopOf(sc) { return sc === window ? window.scrollY : sc.scrollTop; }
+    function scrollToPos(sc, pos) { sc === window ? window.scrollTo(0, pos) : (sc.scrollTop = pos); }
+    function scrollByPx(sc, px) {
+        if (sc === window) window.scrollBy(0, px);
+        else sc.scrollBy({ top: px, behavior: 'auto' });
+    }
+    function atBottom(sc) {
+        if (sc === window) return window.innerHeight + window.scrollY >= document.body.scrollHeight - 100;
+        return sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 100;
+    }
+
+    // --- Player name extraction from match page header -------------------
+    // Two player names from the middleColumn header, last-name form, or null.
+    function getMiddleColumnPlayers() {
+        const middleColumn = xpathFirst("//*[@data-testid='middleColumn']");
+        if (!middleColumn) return null;
+
+        const playerDivs = xpathNodes(
+            ".//div[string-length(normalize-space(text())) > 2 and contains(text(), ' ') and not(contains(text(), ':')) and not(contains(text(), 'ATP')) and not(contains(text(), 'WTA')) and not(contains(text(), '1/')) and not(contains(text(), 'Extract')) and not(starts-with(normalize-space(text()), '€')) and not(contains(text(), '€'))]",
+            middleColumn
+        );
+
+        const players = [];
+        for (const div of playerDivs) {
+            const name = div.textContent.trim();
+            if (name && /^[A-ZÀ-ÖØ-ÿ]/.test(name) && !/^\d/.test(name) && !players.includes(name)) {
+                players.push(name.split(' ').at(-1));
+                if (players.length >= 2) break;
+            }
+        }
+        return players.length >= 2 ? players : null;
+    }
+
+    // --- Sports list: match cards ---------------------------------------
+    const dayIndicators = ['demain', 'sam', 'dim', 'lun', 'mar', 'mer', 'jeu', 'ven'];
+
+    function isDayIndicator(text) {
+        const lower = text.toLowerCase();
+        return dayIndicators.some(ind => lower === ind || lower.startsWith(ind + '.'));
+    }
+
+    function looksLikePlayerName(text) {
+        if (!text || text.length < 2) return false;
+        if (/^\d+(?:[.,]\d+)?$/.test(text)) return false;
+        if (isDayIndicator(text)) return false;
+        return /[A-ZÀ-ÖØ-öø-ÿ]/.test(text) || /^[a-zA-ZÀ-ÖØ-öø-ÿ\s.-]{2,}$/.test(text);
+    }
+
+    // Status words shown instead of/next to players on live cards.
+    const liveStatusWords = ['en direct', 'direct', 'interrompu', 'abandon', 'terminé', 'termine',
+        'suspendu', 'forfait', 'live', 'pending', 'à venir', 'a venir'];
+
+    function isLiveStatus(text) {
+        const lower = text.toLowerCase().trim();
+        return liveStatusWords.some(w => lower === w);
+    }
+
+    /**
+     * Parse one `match-card-*` element.
+     * @param {Element} card
+     * @param {{includeLive?: boolean}} opts  includeLive keeps cards without a start
+     *        time (in-play matches) instead of returning null.
+     * @returns {Match|null}
+     */
+    function extractMatchInfo(card, opts) {
+        opts = opts || {};
+        const texts = [];
+        const walker = document.createTreeWalker(card, NodeFilter.SHOW_TEXT);
+        while (walker.nextNode()) {
+            const text = walker.currentNode.textContent.trim();
+            if (text.length > 0) texts.push(text);
+        }
+
+        let tournamentIdx = -1;
+        for (let i = 0; i < texts.length; i++) {
+            if (texts[i].includes('ATP') || texts[i].includes('WTA')) { tournamentIdx = i; break; }
+        }
+        if (tournamentIdx === -1) return null;
+
+        let tournament = texts[tournamentIdx];
+        tournament = tournament.replace(/\s+\d+(?:[.,]\d+)?$/, '').trim();
+        if (tournament.toLowerCase().includes('double')) return null;
+
+        const testid = card.getAttribute('data-testid') || '';
+        const matchId = testid.startsWith('match-card-') ? testid.slice('match-card-'.length) : '';
+
+        let timeIdx = -1;
+        let dayIndicator = '';
+        for (let i = 0; i < texts.length; i++) {
+            const t = texts[i];
+            if (/^\d{1,2}:\d{2}$/.test(t)) {
+                timeIdx = i;
+                if (i > 0 && isDayIndicator(texts[i - 1])) dayIndicator = texts[i - 1];
+                break;
+            }
+        }
+
+        let matchTime = '';
+        let player1 = '';
+        let player2 = '';
+        let live = false;
+
+        if (timeIdx !== -1) {
+            matchTime = texts[timeIdx];
+            for (let i = timeIdx - 1; i >= 0; i--) {
+                const t = texts[i];
+                if (isDayIndicator(t)) continue;
+                if (looksLikePlayerName(t)) { player1 = t; break; }
+            }
+            for (let i = timeIdx + 1; i < texts.length; i++) {
+                const t = texts[i];
+                if (looksLikePlayerName(t)) { player2 = t; break; }
+            }
+        } else if (opts.includeLive) {
+            // In-play card: no start time, first two name-like texts are the players.
+            live = true;
+            const candidates = [];
+            for (let i = tournamentIdx + 1; i < texts.length && candidates.length < 2; i++) {
+                const t = texts[i];
+                if (isDayIndicator(t) || isLiveStatus(t)) continue;
+                if (!looksLikePlayerName(t)) continue;
+                if (!/\s/.test(t)) continue;           // require "First Last"
+                candidates.push(t);
+            }
+            if (candidates.length === 2) {
+                [player1, player2] = candidates;
+            }
+        }
+
+        if (!player1 || !player2 || player1 === player2) return null;
+        if (!live && timeIdx === -1) return null;
+
+        let round = '';
+        if (timeIdx !== -1) {
+            for (let i = tournamentIdx + 1; i < texts.length; i++) {
+                if (/^\d{1,2}:\d{2}$/.test(texts[i])) break;
+                if (looksLikePlayerName(texts[i])) break;
+                if (!isDayIndicator(texts[i]) && texts[i] !== tournament && !texts[i].includes('ATP') && !texts[i].includes('WTA')) {
+                    round = texts[i];
+                    break;
+                }
+            }
+        } else if (opts.includeLive) {
+            // In-play card (no clock): the round sits between the tournament
+            // and the first player — e.g. 'ATP - Shanghai' '1/4' '<player>'.
+            // Score digits ('40', '6', …) come after the players, so stop there.
+            for (let i = tournamentIdx + 1; i < texts.length; i++) {
+                const t = texts[i];
+                if (t === tournament || isDayIndicator(t) || isLiveStatus(t)) continue;
+                if (looksLikePlayerName(t)) break;
+                if (/\d/.test(t) || /^(finale|tour|qualif)/i.test(t)) { round = t; break; }
+            }
+        }
+
+        // 1X2 odds + implied percentages from the card itself.
+        let oddP1 = null, oddP2 = null, pctP1 = null, pctP2 = null;
+        const oddBtns = card.querySelectorAll("[data-testid^='odd-button-']");
+        const values = [];
+        for (const btn of oddBtns) {
+            const v = btn.querySelector('.odd-button-value');
+            if (v) values.push(v.textContent.trim());
+            if (values.length >= 2) break;
+        }
+        if (values.length >= 2 && values[0] !== '-' && values[1] !== '-') {
+            oddP1 = parseFloat(values[0].replace(',', '.'));
+            oddP2 = parseFloat(values[1].replace(',', '.'));
+            if (Number.isNaN(oddP1)) oddP1 = null;
+            if (Number.isNaN(oddP2)) oddP2 = null;
+        }
+        const pctEls = card.querySelectorAll("[class*='percent-distribution-completeness']");
+        const pcts = [];
+        for (const el of pctEls) {
+            const m = el.textContent.trim().match(/^(\d+(?:[.,]\d+)?)\s*%$/);
+            if (m) pcts.push(parseFloat(m[1].replace(',', '.')));
+            if (pcts.length >= 2) break;
+        }
+        if (pcts.length >= 2) { pctP1 = pcts[0]; pctP2 = pcts[1]; }
+
+        return {
+            matchId, url: matchId ? matchPagePrefix + matchId : '',
+            tournament, round, player1, player2, matchTime, dayIndicator,
+            dayOffset: 0, live, oddP1, oddP2, pctP1, pctP2
+        };
+    }
+
+    function extractCurrentMatches(opts) {
+        const matches = [];
+        const cards = xpathNodes("//*[starts-with(@data-testid, 'match-card-')]");
+        for (const card of cards) {
+            try {
+                const info = extractMatchInfo(card, opts || {});
+                if (info) matches.push(info);
+            } catch (err) { console.warn('winamax_core: card parse failed', err); }
+        }
+        return matches;
+    }
+
+    function timeToMinutes(timeStr) {
+        const parts = String(timeStr || '').split(':');
+        const h = parseInt(parts[0], 10);
+        const m = parseInt(parts[1], 10);
+        if (Number.isNaN(h) || Number.isNaN(m)) return -1;
+        return h * 60 + m;
+    }
+
+    /**
+     * Scroll the tennis list and collect singles matches (userscript "sports" mode).
+     * @param {{stopAtNightGap?: boolean, includeLive?: boolean, onProgress?: Function,
+     *          stepPx?: number, delayMs?: number, maxNoNew?: number}} opts
+     * @returns {Promise<Match[]>}
+     */
+    async function scanMatches(opts) {
+        opts = opts || {};
+        const stopAtNightGap = opts.stopAtNightGap !== false;
+        const includeLive = !!opts.includeLive;
+        const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null;
+        const stepPx = opts.stepPx || 1000;
+        const delayMs = opts.delayMs == null ? 100 : opts.delayMs;
+        const maxNoNew = opts.maxNoNew || 8;
+
+        const todayMatches = new Map();
+        const allSeen = new Map();
+        const scrollable = findScrollableContainer();
+        const NIGHT_GAP_THRESHOLD = 360; // 6 hours in minutes
+        let stoppedByNightGap = false;
+        let lastRawMinutes = -1;
+        let lastNormalized = -1;
+        let dayOffset = 0;
+
+        function shouldKeepMatch(m) {
+            if (m.live) return true;              // in-play cards have no clock
+            const raw = timeToMinutes(m.matchTime);
+            if (raw < 0) return false;
+
+            if (lastRawMinutes === -1) {
+                lastRawMinutes = raw;
+                lastNormalized = raw;
+                return true;
+            }
+
+            if (raw < lastRawMinutes) dayOffset += 1440;   // midnight wrap
+            const normalized = raw + dayOffset;
+            const gap = normalized - lastNormalized;
+            if (gap > NIGHT_GAP_THRESHOLD && stopAtNightGap) {
+                stoppedByNightGap = true;
+                return false;                     // first match of the next session
+            }
+
+            lastRawMinutes = raw;
+            lastNormalized = normalized;
+            return true;
+        }
+
+        const scanOpts = { includeLive: includeLive };
+        let initialMatches = extractCurrentMatches(scanOpts);
+        for (const m of initialMatches) {
+            const key = `${m.player1}|${m.player2}|${m.tournament}|${m.round}`;
+            allSeen.set(key, m);
+            if (stoppedByNightGap) continue;
+            if (shouldKeepMatch(m)) {
+                m.dayOffset = Math.round(dayOffset / 1440);
+                todayMatches.set(key, m);
+            }
+        }
+        if (onProgress) onProgress(todayMatches.size);
+        if (stoppedByNightGap) return Array.from(todayMatches.values());
+
+        let noNewCount = 0;
+        const originalScrollTop = scrollTopOf(scrollable);
+
+        while (noNewCount < maxNoNew && !stoppedByNightGap) {
+            const oldScrollTop = scrollTopOf(scrollable);
+            scrollByPx(scrollable, stepPx);
+            await sleep(delayMs);
+            const newScrollTop = scrollTopOf(scrollable);
+            if (newScrollTop === oldScrollTop) break;
+
+            let added = 0;
+            for (const m of extractCurrentMatches(scanOpts)) {
+                const key = `${m.player1}|${m.player2}|${m.tournament}|${m.round}`;
+                if (allSeen.has(key)) continue;
+                allSeen.set(key, m);
+                if (stoppedByNightGap) continue;
+                if (shouldKeepMatch(m)) {
+                    m.dayOffset = Math.round(dayOffset / 1440);
+                    todayMatches.set(key, m);
+                    added++;
+                }
+            }
+            if (added === 0) noNewCount++;
+            else noNewCount = 0;
+            if (onProgress) onProgress(todayMatches.size);
+            if (atBottom(scrollable)) break;
+        }
+
+        scrollToPos(scrollable, originalScrollTop);
+        return Array.from(todayMatches.values());
+    }
+
+    function formatMatches(matches) {
+        return matches.map(m => {
+            const suffix = m.round ? ` - ${m.round}` : '';
+            return `${m.player1} vs ${m.player2} (${m.tournament}${suffix})`;
+        }).join('\n');
+    }
+
+    // --- Match page: section discovery ----------------------------------
+    function isSectionHeading(span) {
+        const childDiv = span.querySelector && span.querySelector(':scope > div');
+        const title = ((childDiv && childDiv.textContent) || span.textContent || '').trim();
+
+        if (!title || title.length < 2 || title.length > 40) return false;
+        if (/^\d+([.,]\d+)?%?$/.test(title)) return false;
+        if (/^(Extract|Plus de|Moins de|Titulaire|Nouveau|NEW|\?)/i.test(title)) return false;
+        if (/^[A-Z][a-z]+\s[A-Z][a-z]+$/.test(title) &&
+            !/(Résultat|Double chance|Buteur|Buteurs|Score|Nombre|Écart|Total|Match|Vainqueur|Mi-temps|Buts|Tirs|Joueur|Serial)/i.test(title)) {
+            return false;
+        }
+        return true;
+    }
+
+    function hasAssociatedOdds(headingEl) {
+        let node = headingEl.parentNode;
+        while (node && node !== document.body) {
+            if (xpathBool(".//div[starts-with(@data-testid, 'odd-button-')]", node)) return true;
+            node = node.parentNode;
+        }
+        return false;
+    }
+
+    /**
+     * All section headings currently rendered on the match page.
+     * Initialises `dataset.originalTitle` on each heading (used by the
+     * userscript's per-section buttons and by extractSectionData).
+     */
+    function findSectionHeadings() {
+        const context = xpathFirst(
+            "//*[@data-testid='middleColumn'] | //*[contains(@class, 'ReactVirtualized__Grid')]") || document;
+        const allSpans = xpathNodes(".//span[div[not(*)]]", context);
+        const headings = [];
+        for (const span of allSpans) {
+            if (!isSectionHeading(span)) continue;
+            if (!hasAssociatedOdds(span)) continue;
+            if (!span.dataset || !span.dataset.originalTitle) {
+                const childDiv = span.querySelector(':scope > div');
+                span.dataset.originalTitle =
+                    ((childDiv && childDiv.textContent) || span.textContent || '').trim();
+            }
+            headings.push(span);
+        }
+        return headings;
+    }
+
+    // --- Match page: section expansion ----------------------------------
+    async function expandSection(sectionContainer) {
+        const currentOdds = xpathNodes(".//div[starts-with(@data-testid, 'odd-button-')]", sectionContainer);
+
+        // <= 2 odds: compact grid view — switch to list view via the layout toggle.
+        if (currentOdds.length <= 2) {
+            const tabsWrapper = xpathFirst(".//*[contains(@class, 'tabs-wrapper')]", sectionContainer);
+            if (tabsWrapper) {
+                const toggleDiv = xpathFirst(".//*[local-name()='svg']/parent::*", tabsWrapper);
+                if (toggleDiv && toggleDiv.click) {
+                    toggleDiv.click();
+                    await sleep(500);
+                }
+            } else {
+                const possibleToggles = xpathNodes(".//*[local-name()='svg' and .//*[local-name()='rect']]/parent::*", sectionContainer);
+                for (const toggle of possibleToggles) {
+                    if (toggle.click && toggle.innerText === '') {
+                        toggle.click();
+                        await sleep(500);
+                        break;
+                    }
+                }
+            }
+        }
+
+        const expandBtns = xpathNodes(
+            ".//div[contains(text(),'Plus de sélections')]/ancestor::div[contains(@class, 'expand-button') or contains(@class, 'expand')] | .//div[contains(text(),'Plus de sélections')]/..",
+            sectionContainer
+        );
+        for (const btn of expandBtns) {
+            if (btn.textContent.trim().includes('Plus de sélections')) {
+                btn.click();
+                await sleep(200);
+            }
+        }
+    }
+
+    // Player-market sections (bet-group-template with team sub-sections or
+    // Buteur/Passeur/Décisif column headers) — but never "Score exact".
+    function isPlayerMarketSection(sectionContainer) {
+        const hasBetGroupTemplate = xpathBool(".//*[contains(@class, 'bet-group-template')]", sectionContainer);
+        if (!hasBetGroupTemplate) return false;
+
+        const headerRow = xpathFirst(
+            ".//*[contains(@class, 'bet-group-template')]//*[1][self::div or self::header]", sectionContainer);
+        if (headerRow) {
+            const headerCells = xpathNodes(".//p", headerRow);
+            if (headerCells.length > 0) {
+                const headerTexts = headerCells.map(c => c.textContent.trim());
+                const hasColumnHeaders = headerTexts.some(h => /buteur|passeur|décisif|but|passe/i.test(h));
+                if (hasColumnHeaders) return true;
+            }
+        }
+
+        const teamContainers = xpathNodes(".//*[contains(@class, 'bet-group-template')]/div", sectionContainer);
+        if (teamContainers.length >= 2) {
+            let teamsWithPlayers = 0;
+            for (const tc of teamContainers) {
+                const hasPlayerName = xpathBool(
+                    ".//*[self::p or self::span or self::div][string-length(normalize-space(text())) > 3 and contains(text(), ' ') and not(contains(text(), ':')) and not(contains(text(), 'ATP')) and not(contains(text(), 'WTA')) and not(contains(text(), 'Plus de')) and not(contains(text(), 'Moins de')) and not(contains(text(), 'Extract'))]",
+                    tc
+                );
+                if (hasPlayerName) teamsWithPlayers++;
+            }
+            if (teamsWithPlayers >= 2) return true;
+        }
+        return false;
+    }
+
+    // --- Match page: structured extraction -------------------------------
+
+    // "Double chance" sections: outcome titles with their odds.
+    function extractDoubleChanceRows(sectionContainer, title) {
+        const rows = [];
+        const outcomeTitles = xpathNodes(
+            ".//div[contains(@class, 'bet-group-outcome-title')]//div[contains(@class, 'label-text')]",
+            sectionContainer
+        );
+        for (const titleEl of outcomeTitles) {
+            const label = titleEl.textContent.trim();
+            if (!label) continue;
+
+            let oddsValue = '';
+            let current = titleEl;
+            while (current && current !== sectionContainer) {
+                const oddsEl = xpathFirst(".//span[contains(@class, 'odd-button-value')]", current.parentNode);
+                if (oddsEl) {
+                    oddsValue = oddsEl.textContent.trim().replace(',', '.');
+                    break;
+                }
+                current = current.parentNode;
+            }
+            if (label && oddsValue) rows.push({ t: 'row', label, value: oddsValue });
+        }
+        return rows;
+    }
+
+    // Collect odds cells for one player block inside a player-market section.
+    function collectPlayerCells(playerBlock, columnHeaders) {
+        const oddsWrappers = xpathNodes(
+            ".//div[.//div[starts-with(@data-testid, 'odd-button-')]]", playerBlock);
+
+        // Column-based market (headers present): first wrapper only, 1 row of columns.
+        if (columnHeaders.length > 0) {
+            const wrapper = oddsWrappers.length > 0 ? oddsWrappers[0] : playerBlock;
+            const oddButtons = xpathNodes(".//div[starts-with(@data-testid, 'odd-button-')]", wrapper);
+            const cells = [];
+            oddButtons.forEach((btn, i) => {
+                const span = xpathFirst(".//span[contains(@class, 'odd-button-value')]", btn);
+                if (!span) return;
+                const value = span.textContent.trim().replace(',', '.');
+                const colName = (i < columnHeaders.length) ? columnHeaders[i] : `Col${i + 1}`;
+                cells.push({ label: colName, value, spaced: false });
+            });
+            return cells;
+        }
+
+        // Threshold ("paliers") market: every wrapper, labelled by outcome name.
+        const cells = [];
+        for (const wrapper of oddsWrappers) {
+            const oddButtons = xpathNodes(".//div[starts-with(@data-testid, 'odd-button-')]", wrapper);
+            for (const btn of oddButtons) {
+                const valueSpan = xpathFirst(".//span[contains(@class, 'odd-button-value')]", btn);
+                if (!valueSpan) continue;
+                const oddValue = valueSpan.textContent.trim().replace(',', '.');
+
+                let outcomeName = '';
+                const valueContainer = valueSpan.parentElement;
+                if (valueContainer && valueContainer.previousElementSibling) {
+                    outcomeName = valueContainer.previousElementSibling.textContent.trim();
+                }
+                if (!outcomeName) {
+                    const nameDiv = xpathFirst(
+                        ".//*[contains(@class, 'odd-button-name') or contains(@class, 'outcome-name')]", btn);
+                    if (nameDiv) outcomeName = nameDiv.textContent.trim();
+                }
+                if (outcomeName && oddValue) cells.push({ label: outcomeName, value: oddValue, spaced: true });
+            }
+        }
+        return cells;
+    }
+
+    function playerNameElementsIn(container) {
+        return xpathNodes(
+            ".//*[self::p or self::span or self::div][string-length(normalize-space(text())) > 1 and contains(text(), ' ') and not(contains(text(), ':')) and not(contains(text(), 'ATP')) and not(contains(text(), 'WTA')) and not(contains(text(), 'Plus de')) and not(contains(text(), 'Moins de'))]",
+            container
+        );
+    }
+
+    function teamNameElementIn(container) {
+        return xpathFirst(
+            ".//*[self::p or self::span or self::div][string-length(normalize-space(text())) > 1 and not(contains(text(), 'Plus de sélections')) and not(contains(text(), 'paliers')) and not(contains(text(), 'ATP')) and not(contains(text(), 'WTA'))]",
+            container
+        );
+    }
+
+    // Walk up from a name element to the block that owns the odds buttons.
+    function findPlayerBlock(nameEl, boundary) {
+        let cur = nameEl.parentNode;
+        while (cur && cur !== boundary) {
+            if (xpathBool(".//div[starts-with(@data-testid, 'odd-button-')]", cur)) return cur;
+            cur = cur.parentNode;
+        }
+        return nameEl.parentNode;
+    }
+
+    // Player-market sections (team split or direct player blocks) -> rows.
+    function extractPlayerMarketRows(sectionContainer, title) {
+        const columnHeaders = [];
+        const headerRow = xpathFirst(
+            ".//*[contains(@class, 'bet-group-template')]//*[1][self::div or self::header]", sectionContainer);
+        if (headerRow) {
+            for (const c of xpathNodes(".//p", headerRow)) columnHeaders.push(c.textContent.trim());
+        }
+
+        const teamContainers = xpathNodes(".//*[contains(@class, 'bet-group-template')]/div", sectionContainer);
+
+        function playerRowFor(nameEl, container) {
+            const playerName = nameEl.textContent.trim();
+            if (!playerName) return null;
+            const playerBlock = findPlayerBlock(nameEl, container);
+            if (!playerBlock) return null;
+            const cells = collectPlayerCells(playerBlock, columnHeaders);
+            if (cells.length === 0) return null;
+            return { t: 'player', label: playerName, cells };
+        }
+
+        // Case 1: team-split format (e.g. "Joueur décisif").
+        if (teamContainers.length > 0) {
+            const rows = [];
+            const singleUntitled = teamContainers.length === 1 && !teamNameElementIn(teamContainers[0]);
+
+            for (const tc of teamContainers) {
+                const teamNameEl = teamNameElementIn(tc);
+                const teamName = teamNameEl ? teamNameEl.textContent.trim() : '';
+                const containerRows = [];
+                for (const nameEl of playerNameElementsIn(tc)) {
+                    const row = playerRowFor(nameEl, tc);
+                    if (row) containerRows.push(row);
+                }
+                if (containerRows.length === 0) continue;
+                if (!singleUntitled && teamName) rows.push({ t: 'team', label: teamName });
+                rows.push(...containerRows);
+            }
+            return rows.length > 0 ? rows : null;
+        }
+
+        // Case 2: direct player blocks inside bet-group-template.
+        const candidateBlocks = xpathNodes(
+            ".//*[contains(@class, 'bet-group-template')]//*[.//div[starts-with(@data-testid, 'odd-button-')]]",
+            sectionContainer
+        );
+        const rows = [];
+        for (const block of candidateBlocks) {
+            const hasPlayerName = xpathBool(
+                ".//*[self::p or self::span or self::div][string-length(normalize-space(text())) > 1 and contains(text(), ' ') and not(contains(text(), ':')) and not(contains(text(), 'ATP')) and not(contains(text(), 'WTA')) and not(contains(text(), 'Plus de')) and not(contains(text(), 'Moins de'))]",
+                block
+            );
+            if (!hasPlayerName) continue;
+            const nameEl = playerNameElementsIn(block)[0];
+            if (!nameEl) continue;
+            const row = playerRowFor(nameEl, block);
+            if (row) rows.push(row);
+        }
+        return rows.length > 0 ? rows : null;
+    }
+
+    /**
+     * Extract one section (expand it first).
+     * @param {Element} headingEl heading span (dataset.originalTitle set)
+     * @param {string|null} filter 'over' | 'under' | '<player name>' | null
+     * @returns {Promise<{title, rows, buttonCount}|null>}
+     */
+    async function extractSectionData(headingEl, filter) {
+        if (filter === undefined) filter = null;
+        const title = headingEl.dataset.originalTitle || headingEl.textContent.trim();
+        if (!title || title.length < 2) return null;
+
+        let sectionContainer = null;
+        let node = headingEl.parentNode;
+        while (node && node !== document.body) {
+            if (xpathBool(".//div[starts-with(@data-testid, 'odd-button-')]", node)) {
+                sectionContainer = node;
+                break;
+            }
+            node = node.parentNode;
+        }
+        if (!sectionContainer) return null;
+
+        // Sub-group title for an odd button (walks up while >1 buttons inside).
+        function findGroupTitle(btn) {
+            let current = btn.parentNode;
+            while (current && current !== sectionContainer) {
+                const oddButtonsInCurrent = current.querySelectorAll('[data-testid^="odd-button-"]');
+                if (oddButtonsInCurrent.length <= 1) {
+                    current = current.parentNode;
+                    continue;
+                }
+
+                const walker = document.createTreeWalker(current, NodeFilter.SHOW_TEXT);
+                const candidates = [];
+                while (walker.nextNode()) {
+                    const text = walker.currentNode.textContent.trim();
+                    if (!text) continue;
+
+                    let isInsideBtnOrNoise = false;
+                    let anc = walker.currentNode.parentNode;
+                    while (anc && anc !== current) {
+                        if (anc.dataset && anc.dataset.testid && anc.dataset.testid.startsWith('odd-button-')) {
+                            isInsideBtnOrNoise = true;
+                            break;
+                        }
+                        const className = anc.className || '';
+                        if (typeof className === 'string' && (
+                            className.includes('odd-button-value') ||
+                            className.includes('percent-distribution') ||
+                            className.includes('completeness')
+                        )) {
+                            isInsideBtnOrNoise = true;
+                            break;
+                        }
+                        anc = anc.parentNode;
+                    }
+                    if (isInsideBtnOrNoise) continue;
+
+                    if (text === 'Oui' || text === 'Non' || text === '1' || text === 'N' || text === '2') continue;
+                    if (/^\d+([.,]\d+)?%?$/.test(text)) continue;
+                    if (text.toLowerCase() === title.toLowerCase()) continue;
+                    if (/^(Extract|Plus de|Moins de|Titulaire|Nouveau|NEW|\?)/i.test(text)) continue;
+
+                    candidates.push(text);
+                }
+                if (candidates.length > 0) return candidates[0];
+                current = current.parentNode;
+            }
+            return '';
+        }
+
+        await expandSection(sectionContainer);
+
+        if (title.toLowerCase().includes('chance')) {
+            await sleep(300);
+            const rows = extractDoubleChanceRows(sectionContainer, title);
+            if (rows.length > 0) return { title, rows, buttonCount: countButtons(sectionContainer) };
+        }
+
+        const isScoreExact = title.toLowerCase().includes('score exact');
+        if (!isScoreExact && isPlayerMarketSection(sectionContainer)) {
+            await sleep(300);
+            const rows = extractPlayerMarketRows(sectionContainer, title);
+            if (rows) return { title, rows, buttonCount: countButtons(sectionContainer) };
+            // fall through to standard extraction
+        }
+
+        const oddsButtons = xpathNodes(".//div[starts-with(@data-testid, 'odd-button-')]", sectionContainer);
+        if (oddsButtons.length === 0) return null;
+
+        const rawOdds = [];
+        for (const btn of oddsButtons) {
+            const valueSpan = xpathFirst(".//span[contains(@class, 'odd-button-value')]", btn);
+            if (!valueSpan) continue;
+            const oddValue = valueSpan.textContent.trim();
+            const valueContainer = valueSpan.parentElement;
+
+            let name = '';
+            // Strategy 1: sibling of valueSpan's parent inside the button wrapper
+            const nameDiv = valueContainer ? valueContainer.previousElementSibling : null;
+            if (nameDiv) name = nameDiv.textContent.trim();
+
+            // Strategy 2: name classes inside the button itself
+            if (!name) {
+                const possibleNameDiv = xpathFirst(
+                    ".//*[contains(@class, 'odd-button-name') or contains(@class, 'outcome-name')]", btn);
+                if (possibleNameDiv) name = possibleNameDiv.textContent.trim();
+            }
+
+            // Strategy 3: 'label-text' near the button (never broader classes —
+            // they also carry percentage text like "21%").
+            if (!name) {
+                let current = btn.parentNode;
+                for (let depth = 0; depth < 5 && current && current !== sectionContainer; depth++) {
+                    const labelNode = xpathFirst(".//*[contains(@class, 'label-text')]", current);
+                    if (labelNode) {
+                        const text = labelNode.textContent.trim();
+                        name = text.replace(/\s*\d+([.,]\d+)?%$/, '').trim();
+                        break;
+                    }
+                    current = current.parentNode;
+                }
+            }
+
+            // Strategy 4: text-walking fallback inside the row wrapper
+            if (!name) {
+                let rowWrapper = btn.parentNode;
+                for (let depth = 0; depth < 6 && rowWrapper && rowWrapper !== sectionContainer; depth++) {
+                    const textCount = document.evaluate(
+                        "count(.//text()[normalize-space(.) != ''])",
+                        rowWrapper, null, XPathResult.NUMBER_TYPE, null).numberValue;
+                    if (textCount > 2) break;
+                    rowWrapper = rowWrapper.parentNode;
+                }
+                if (rowWrapper && rowWrapper !== sectionContainer) {
+                    const textNodes = [];
+                    const walker = document.createTreeWalker(rowWrapper, NodeFilter.SHOW_TEXT);
+                    while (walker.nextNode()) {
+                        const val = walker.currentNode.textContent.trim();
+                        if (val && val !== oddValue && val !== oddValue.replace('.', ',') && !val.endsWith('%')) {
+                            textNodes.push(val);
+                        }
+                    }
+                    if (textNodes.length > 0) name = textNodes[0];
+                }
+            }
+
+            if (name && oddValue) {
+                rawOdds.push({
+                    name,
+                    value: oddValue.replace(',', '.'),
+                    groupTitle: findGroupTitle(btn)
+                });
+            }
+        }
+
+        if (rawOdds.length === 0) return null;
+
+        const rows = [];
+        const spreadRegex = /^(.+?)\s+([+-]\d+(?:[.,]\d+)?)$/;
+        let spreadCount = 0;
+        const byPlayer = {};
+        for (const o of rawOdds) {
+            const match = o.name.match(spreadRegex);
+            if (match) {
+                spreadCount++;
+                const playerName = match[1].trim();
+                const handicap = match[2];
+                if (!byPlayer[playerName]) byPlayer[playerName] = [];
+                byPlayer[playerName].push({ sortKey: parseFloat(handicap.replace(',', '.')), raw: o });
+            }
+        }
+
+        if (title.includes('Nombre de jeux') || title.includes('Écart de jeux')) {
+            const overOdds = rawOdds.filter(o => o.name.includes('Plus de'));
+            const underOdds = rawOdds.filter(o => o.name.includes('Moins de'));
+            const sortByValue = (a, b) => parseFloat(a.value) - parseFloat(b.value);
+            overOdds.sort(sortByValue);
+            underOdds.sort(sortByValue);
+
+            if (title.includes('Nombre de jeux')) {
+                if (filter === 'over') {
+                    for (const o of overOdds) {
+                        rows.push({ t: 'row', label: `Over ${o.name.replace('Plus de ', '')}`, value: o.value });
+                    }
+                } else if (filter === 'under') {
+                    for (const o of underOdds) {
+                        rows.push({ t: 'row', label: `Under ${o.name.replace('Moins de ', '')}`, value: o.value });
+                    }
+                } else {
+                    for (const o of overOdds) {
+                        rows.push({ t: 'row', label: `Over ${o.name.replace('Plus de ', '')} jeux`, value: o.value });
+                    }
+                    for (const o of underOdds) {
+                        rows.push({ t: 'row', label: `Under ${o.name.replace('Moins de ', '')} jeux`, value: o.value });
+                    }
+                }
+            } else if (title.includes('Écart de jeux')) {
+                const playerNames = getMiddleColumnPlayers();
+                const p1 = playerNames && playerNames.length >= 2 ? playerNames[0] : null;
+                const p2 = playerNames && playerNames.length >= 2 ? playerNames[1] : null;
+
+                const ecartByPlayer = {};
+                for (const o of rawOdds) {
+                    const spreadMatch = o.name.match(spreadRegex);
+                    const playerNamePart = spreadMatch ? spreadMatch[1].trim() : o.name;
+                    if (!ecartByPlayer[playerNamePart]) ecartByPlayer[playerNamePart] = [];
+                    ecartByPlayer[playerNamePart].push(o);
+                }
+
+                let playersToShow = Object.keys(ecartByPlayer);
+                if (filter && p1 && p2 && (filter === p1 || filter === p2)) {
+                    playersToShow = playersToShow.filter(p => p.includes(filter));
+                }
+                playersToShow.sort();
+
+                for (const player of playersToShow) {
+                    ecartByPlayer[player].sort((a, b) => parseFloat(a.value) - parseFloat(b.value));
+                    for (const o of ecartByPlayer[player]) {
+                        rows.push({ t: 'row', label: o.name, value: o.value });
+                    }
+                }
+            }
+        } else if (spreadCount > rawOdds.length / 2) {
+            const sortedPlayers = Object.keys(byPlayer).sort();
+            for (const player of sortedPlayers) {
+                byPlayer[player].sort((a, b) => a.sortKey - b.sortKey);
+                for (const item of byPlayer[player]) {
+                    rows.push({ t: 'row', label: item.raw.name, value: item.raw.value });
+                }
+            }
+        } else {
+            const groups = new Map();
+            for (const o of rawOdds) {
+                if (!groups.has(o.groupTitle)) groups.set(o.groupTitle, []);
+                groups.get(o.groupTitle).push(o);
+            }
+            for (const [groupTitle, groupOdds] of groups.entries()) {
+                if (groupTitle) rows.push({ t: 'group', label: groupTitle });
+                for (const o of groupOdds) rows.push({ t: 'row', label: o.name, value: o.value });
+            }
+        }
+
+        if (rows.length === 0) return null;
+        return { title, rows, buttonCount: oddsButtons.length };
+    }
+
+    function countButtons(container) {
+        return xpathNodes(".//div[starts-with(@data-testid, 'odd-button-')]", container).length;
+    }
+
+    // --- Formatting (userscript clipboard output) ------------------------
+    function formatSectionRow(row) {
+        switch (row.t) {
+            case 'group': return row.label;
+            case 'team': return `=== ${row.label} ===`;
+            case 'player':
+                return '  ' + row.label + ' | ' +
+                    row.cells.map(c => c.label + (c.spaced ? ' : ' : ': ') + c.value).join(' | ');
+            default: return `${row.label} : ${row.value}`;
+        }
+    }
+
+    function isOverUnderTitle(title) {
+        return title.includes('Nombre de jeux') || title.includes('Écart de jeux');
+    }
+
+    // One section as clipboard text (title first, unless Over/Under section).
+    function formatSection(section) {
+        const lines = [];
+        if (!isOverUnderTitle(section.title)) lines.push(section.title);
+        for (const row of section.rows) lines.push(formatSectionRow(row));
+        return lines.join('\n');
+    }
+
+    // Whole match page as clipboard text (legacy "Extract all odds" output).
+    function formatAllOddsText(odds) {
+        const out = [];
+        for (const section of odds.sections) {
+            if (!isOverUnderTitle(section.title)) out.push(section.title);
+            for (const row of section.rows) out.push(formatSectionRow(row));
+            out.push('');
+        }
+        while (out.length > 0 && out[out.length - 1] === '') out.pop();
+        return out.join('\n');
+    }
+
+    /**
+     * Scroll a match page, expanding every section, and return all odds as JSON.
+     * @param {{delayMs?: number, stepPx?: number, maxNoNew?: number,
+     *          onProgress?: Function}} opts
+     * @returns {Promise<OddsJSON>}
+     */
+    async function extractOddsJSON(opts) {
+        opts = opts || {};
+        const delayMs = opts.delayMs == null ? 250 : opts.delayMs;
+        const stepPx = opts.stepPx || 500;
+        const maxNoNew = opts.maxNoNew || 15;
+        const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null;
+
+        const scrollable = findScrollableContainer();
+        const sections = [];
+        const processed = new Set();
+        let buttonCount = 0;
+
+        scrollToPos(scrollable, 0);
+        await sleep(300);
+
+        let prevScrollTop = -1;
+        let noNewSectionsCount = 0;
+        while (noNewSectionsCount < maxNoNew) {
+            let foundNew = false;
+            for (const heading of findSectionHeadings()) {
+                if (processed.has(heading)) continue;
+                processed.add(heading);
+                const data = await extractSectionData(heading, null);
+                if (data) {
+                    sections.push(data);
+                    buttonCount += data.buttonCount;
+                    foundNew = true;
+                    if (onProgress) onProgress(sections.length, countOddsRows(data.rows));
+                }
+            }
+
+            noNewSectionsCount = foundNew ? 0 : noNewSectionsCount + 1;
+
+            const oldScrollTop = scrollTopOf(scrollable);
+            scrollByPx(scrollable, stepPx);
+            await sleep(delayMs);
+            const newScrollTop = scrollTopOf(scrollable);
+            if (newScrollTop === oldScrollTop && prevScrollTop === newScrollTop) break;
+            prevScrollTop = oldScrollTop;
+
+            if (scrollable === window) {
+                if (window.innerHeight + window.scrollY >= document.body.scrollHeight - 100) break;
+            } else {
+                if (scrollable.scrollTop + scrollable.clientHeight >= scrollable.scrollHeight - 100) break;
+            }
+        }
+
+        const odds = {
+            url: location.href,
+            players: getMiddleColumnPlayers(),
+            sections,
+            sectionCount: sections.length,
+            buttonCount
+        };
+        odds.oddCount = countOddsRows(formatAllOddsText(odds).split('\n'));
+        return odds;
+    }
+
+    // rows: array of Row objects; textLines: array of formatted lines
+    function countOddsRows(x) {
+        if (Array.isArray(x) && x.length > 0 && typeof x[0] === 'string') {
+            return x.filter(line => line.includes(':')).length;
+        }
+        const rows = Array.isArray(x) ? x : [];
+        return rows.filter(r => r.t === 'row' || r.t === 'player').length;
+    }
+
+    // --- Public API ------------------------------------------------------
+    window.WinamaxCore = {
+        sleep,
+        xpathNodes,
+        findScrollableContainer,
+        matchPagePrefix,
+        sportsPageUrl,
+        dayIndicators,
+        isDayIndicator,
+        looksLikePlayerName,
+        extractMatchInfo,
+        extractCurrentMatches,
+        timeToMinutes,
+        scanMatches,
+        formatMatches,
+        getMiddleColumnPlayers,
+        isSectionHeading,
+        hasAssociatedOdds,
+        findSectionHeadings,
+        expandSection,
+        isPlayerMarketSection,
+        extractSectionData,
+        formatSectionRow,
+        isOverUnderTitle,
+        formatSection,
+        formatAllOddsText,
+        extractOddsJSON
+    };
+})();
+
+// ================= userscript UI (src/ui.js) =================
+// ----- Aliases to the shared extraction core -----------------------------
+// winamax_core.js is prepended to this file by tennis_stats/tools/build_userscript.py;
+// keep this file free of extraction/selector logic (it lives in the core only).
+const extractSectionData = WinamaxCore.extractSectionData;
+const getMiddleColumnPlayers = WinamaxCore.getMiddleColumnPlayers;
+
+// ----- [original script.js lines 18-72] -----
     // Cross-browser clipboard copy (compatible with Safari iOS, Safari Userscripts, Tampermonkey, etc.)
     async function copyToClipboard(text) {
         // Method 1: GM.setClipboard (GM4-style, async — works in Userscripts on Safari)
@@ -70,64 +1121,7 @@
 
         return false;
     }
-
-    // Evaluate XPath and return array of nodes
-    function xpathNodes(xpath, context = document) {
-        const result = document.evaluate(xpath, context, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-        const nodes = [];
-        for (let i = 0; i < result.snapshotLength; i++) nodes.push(result.snapshotItem(i));
-        return nodes;
-    }
-
-    function waitForXPath(xpath, timeout = 3000, context = document) {
-        return new Promise((resolve, reject) => {
-            const existing = document.evaluate(xpath, context, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-            if (existing) return resolve(existing);
-            const observer = new MutationObserver(() => {
-                const el = document.evaluate(xpath, context, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-                if (el) { observer.disconnect(); resolve(el); }
-            });
-            observer.observe(context === document ? document.body : context, { childList: true, subtree: true });
-            setTimeout(() => { observer.disconnect(); reject(new Error(`Timeout XPath: ${xpath}`)); }, timeout);
-        });
-    }
-
-    // --- Player name extraction from match page header -------------------
-    // Retrieves the two player names from the middleColumn header using resilient XPath.
-    // Returns an array of two strings [player1, player2] or null if not found.
-    function getMiddleColumnPlayers() {
-        const middleColumn = document.evaluate(
-            "//*[@data-testid='middleColumn']",
-            document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
-        ).singleNodeValue;
-        if (!middleColumn) return null;
-
-        // Player names are in divs that contain text with a space (First Last pattern),
-        // located within the match header area (the first section of middleColumn).
-        // We find the match-route-anchor area and look for player name divs near it.
-        // The structure has: tournament/round info at top, then player blocks side by side,
-        // then time, then odds buttons.
-
-        // Strategy: Find all leaf divs in the upper portion of middleColumn that look like names
-        // (two or more capitalized words, not containing ATP/WWTA/digits/colons)
-        const playerDivs = xpathNodes(
-            ".//div[string-length(normalize-space(text())) > 2 and contains(text(), ' ') and not(contains(text(), ':')) and not(contains(text(), 'ATP')) and not(contains(text(), 'WTA')) and not(contains(text(), '1/')) and not(contains(text(), 'Extract')) and not(starts-with(normalize-space(text()), '€')) and not(contains(text(), '€'))]",
-            middleColumn
-        );
-
-        const players = [];
-        for (const div of playerDivs) {
-            const name = div.textContent.trim();
-            // Must look like a name: starts with uppercase letter, has a space, no digits
-            if (name && /^[A-ZÀ-ÖØ-ÿ]/.test(name) && !/^\d/.test(name) && !players.includes(name)) {
-                players.push(name.split(' ').at(-1));
-                if (players.length >= 2) break;
-            }
-        }
-
-        return players.length >= 2 ? players : null;
-    }
-
+// ----- [original script.js lines 131-169] -----
     // --- Page detection -------------------------------------------------
     const MATCH_PAGE_PREFIX = 'https://www.winamax.fr/paris-sportifs/match/';
     const SPORTS_PAGE_URL = 'https://www.winamax.fr/paris-sportifs/sports/5';
@@ -167,50 +1161,7 @@
         }, 3000);
     }
 
-    // --- Per-section extract button injection ----------------------------
-
-    // Determines if an element is a valid section heading
-    function isSectionHeading(span) {
-        // Get the title text from the child div
-        const childDiv = span.querySelector && span.querySelector(':scope > div');
-        const title = ((childDiv && childDiv.textContent) || span.textContent || '').trim();
-
-        // Filter: title must be 2-40 chars
-        if (!title || title.length < 2 || title.length > 40) return false;
-
-        // Filter: skip pure numbers, percentages, short codes
-        if (/^\d+([.,]\d+)?%?$/.test(title)) return false;
-
-        // Filter: skip common UI text
-        if (/^(Extract|Plus de|Moins de|Titulaire|Nouveau|NEW|\?)/i.test(title)) return false;
-
-        // Filter: skip if it looks like a player name (First Last) with no section context
-        // Section titles are typically single words or short phrases
-        if (/^[A-Z][a-z]+\s[A-Z][a-z]+$/.test(title) && 
-            !/(Résultat|Double chance|Buteur|Buteurs|Score|Nombre|Écart|Total|Match|Vainqueur|Mi-temps|Buts|Tirs|Joueur|Serial)/i.test(title)) {
-            return false;
-        }
-
-        return true;
-    }
-
-    // Determines if a heading element is associated with odds content
-    function hasAssociatedOdds(headingEl) {
-        // Navigate up to find section container
-        let node = headingEl.parentNode;
-        while (node && node !== document.body) {
-            const hasOdds = document.evaluate(
-                ".//div[starts-with(@data-testid, 'odd-button-')]", 
-                node, 
-                null, 
-                XPathResult.BOOLEAN_TYPE, 
-                null
-            ).booleanValue;
-            if (hasOdds) return true;
-            node = node.parentNode;
-        }
-        return false;
-    }
+// ----- [original script.js lines 214-435] -----
 
     // Find all section headings and inject a blue "Extract" button next to each
     function injectSectionExtractButtons() {
@@ -218,29 +1169,11 @@
             processedSectionHeadings = new WeakSet();
         }
 
-        // Find the main content container
-        const context = document.evaluate(
-            "//*[@data-testid='middleColumn'] | //*[contains(@class, 'ReactVirtualized__Grid')]",
-            document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
-        ).singleNodeValue || document;
-
-        // Collect all candidate heading spans
-        const allSpans = xpathNodes(".//span[div[not(*)]]", context);
-        const finalHeadings = [];
-        
-        // Filter valid section headings using the new helper functions
-        for (const span of allSpans) {
-            if (!isSectionHeading(span)) continue;
-            if (!hasAssociatedOdds(span)) continue;
-            
-            // Skip if already has a button
-            if (span.dataset && span.dataset.sectionExtract === 'true') continue;
-            if (document.evaluate(
-                ".//*[@data-section-extract='true']", span, null, XPathResult.BOOLEAN_TYPE, null
-            ).booleanValue) continue;
-
-            finalHeadings.push(span);
-        }
+        // Section discovery + heading filters come from the shared core
+        // (one source of truth with the Playwright driver). Skip headings that
+        // already carry an injected button.
+        const finalHeadings = WinamaxCore.findSectionHeadings().filter(h =>
+            !h.querySelector('[data-section-extract="true"]'));
 
         for (const h of finalHeadings) {
             if (processedSectionHeadings.has(h)) continue;
@@ -275,22 +1208,12 @@
 
                 try {
                     const data = await extractSectionData(h, filter);
-                    if (data && data.odds.length > 0) {
-                        let output = '';
-                        if (!isNombreDeJeuxSection && !isEcartDeJeuxSection) {
-                            output = data.title + '\n';
-                        }
-                        
-                        for (const line of data.odds) {
-                            if (output === '' && line.trim() === '') continue;
-                            output += line + '\n';
-                        }
-                        
-                        // Remove trailing newlines
-                        output = output.replace(/\n+$/, '');
-                        
+                    if (data && data.rows.length > 0) {
+                        // Clipboard text: title first, unless it's an Over/Under section
+                        const output = WinamaxCore.formatSection(data);
+
                         await copyToClipboard(output);
-                        const oddCount = data.odds.filter(line => line.includes(':')).length;
+                        const oddCount = output.split('\n').filter(line => line.includes(':')).length;
                         let filterLabel = '';
                         if (isNombreDeJeuxSection) {
                             filterLabel = filter === 'over' ? ' Over' : filter === 'under' ? ' Under' : '';
@@ -433,970 +1356,7 @@
             }
         }
     }
-
-    // --- Match page extraction (ALL odds from ALL sections) -------------
-    function findScrollableContainer() {
-        const grid = document.evaluate("//*[contains(concat(' ', normalize-space(@class), ' '), ' ReactVirtualized__Grid ')]", document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-        if (!grid) return window;
-        let el = grid.parentElement;
-        while (el && el !== document.body) {
-            const style = getComputedStyle(el);
-            if ((style.overflowY === 'auto' || style.overflowY === 'scroll') && el.scrollHeight > el.clientHeight) return el;
-            el = el.parentElement;
-        }
-        return window;
-    }
-
-    // Expand a section: click the grid/list toggle if needed, then expand "Plus de sélections"
-    async function expandSection(sectionContainer) {
-        // Count current odds to know if we need to toggle view
-        const currentOdds = xpathNodes(".//div[starts-with(@data-testid, 'odd-button-')]", sectionContainer);
-        
-        // If <= 2 odds, the section is in compact grid view.
-        // Click the toggle (div/button with the 4-rect icon) to switch to list view.
-        if (currentOdds.length <= 2) {
-            // Find the tabs-wrapper and click the toggle containing the layout SVG icon
-            const tabsWrapper = document.evaluate(".//*[contains(@class, 'tabs-wrapper')]", sectionContainer, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-            if (tabsWrapper) {
-                const toggleDiv = document.evaluate(".//*[local-name()='svg']/parent::*", tabsWrapper, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-                if (toggleDiv && toggleDiv.click) {
-                    toggleDiv.click();
-                    await sleep(500);
-                }
-            } else {
-                // Fallback: find SVG with rects
-                const possibleToggles = xpathNodes(".//*[local-name()='svg' and .//*[local-name()='rect']]/parent::*", sectionContainer);
-                for (let toggle of possibleToggles) {
-                    if (toggle.click && toggle.innerText === '') {
-                        toggle.click();
-                        await sleep(500);
-                        break;
-                    }
-                }
-            }
-        }
-        
-        // Expand ALL "Plus de sélections" buttons (multiple teams per section)
-        const expandBtns = xpathNodes(
-            ".//div[contains(text(),'Plus de sélections')]/ancestor::div[contains(@class, 'expand-button') or contains(@class, 'expand')] | .//div[contains(text(),'Plus de sélections')]/..",
-            sectionContainer
-        );
-        for (const btn of expandBtns) {
-            if (btn.textContent.trim().includes("Plus de sélections")) {
-                btn.click();
-                await sleep(200);
-            }
-        }
-    }
-
-    // Detect if a section is a player-market section (e.g., "Joueur décisif") with 
-    // team sub-sections and column categories (Buteur/Passeur/Décisif).
-    // IMPORTANT: A standard 1X2 market (like "Résultat") also uses bet-group-template
-    // but does NOT have team sub-sections with player names. We must distinguish them.
-    // A true player-market section has:
-    //   - bet-group-template with team containers that each contain player names
-    //   - OR column headers (Buteur/Passeur/etc.)
-    function isPlayerMarketSection(sectionContainer) {
-        // First check: does it have bet-group-template at all?
-        const hasBetGroupTemplate = document.evaluate(
-            ".//*[contains(@class, 'bet-group-template')]",
-            sectionContainer, null, XPathResult.BOOLEAN_TYPE, null
-        ).booleanValue;
-        if (!hasBetGroupTemplate) return false;
-
-        // Check for column headers (Buteur/Passeur/Décisif) — definitive player market indicator
-        const headerRow = document.evaluate(
-            ".//*[contains(@class, 'bet-group-template')]/*[1][self::div or self::header]",
-            sectionContainer, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
-        ).singleNodeValue;
-        if (headerRow) {
-            const headerCells = xpathNodes(".//p", headerRow);
-            if (headerCells.length > 0) {
-                const headerTexts = headerCells.map(c => c.textContent.trim());
-                // Check for known column header patterns
-                const hasColumnHeaders = headerTexts.some(h => 
-                    /buteur|passeur|décisif|but|passe/i.test(h)
-                );
-                if (hasColumnHeaders) return true;
-            }
-        }
-
-        // Check for team containers with player names inside bet-group-template
-        const teamContainers = xpathNodes(
-            ".//*[contains(@class, 'bet-group-template')]/div",
-            sectionContainer
-        );
-        if (teamContainers.length >= 2) {
-            // Multiple team containers with player-like names (First Last pattern)
-            let teamsWithPlayers = 0;
-            for (const tc of teamContainers) {
-                const hasPlayerName = document.evaluate(
-                    ".//*[self::p or self::span or self::div][string-length(normalize-space(text())) > 3 and contains(text(), ' ') and not(contains(text(), ':')) and not(contains(text(), 'ATP')) and not(contains(text(), 'WTA')) and not(contains(text(), 'Plus de')) and not(contains(text(), 'Moins de')) and not(contains(text(), 'Extract'))]",
-                    tc, null, XPathResult.BOOLEAN_TYPE, null
-                ).booleanValue;
-                if (hasPlayerName) teamsWithPlayers++;
-            }
-            // If 2+ team containers have player names, it's a player market
-            if (teamsWithPlayers >= 2) return true;
-        }
-
-        // Default: not a player market (e.g., standard 1X2 like "Résultat")
-        return false;
-    }
-
-    // Special extraction for "Double chance" sections
-    function extractDoubleChanceOdds(sectionContainer, title) {
-        const outcomes = [];
-        
-        // Find all outcome title elements
-        const outcomeTitles = xpathNodes(
-            ".//div[contains(@class, 'bet-group-outcome-title')]//div[contains(@class, 'label-text')]",
-            sectionContainer
-        );
-        
-        for (const titleEl of outcomeTitles) {
-            const label = titleEl.textContent.trim();
-            if (!label) continue;
-            
-            // Find the corresponding odds value
-            let oddsValue = '';
-            let current = titleEl;
-            while (current && current !== sectionContainer) {
-                const oddsEl = document.evaluate(
-                    ".//span[contains(@class, 'odd-button-value')]",
-                    current.parentNode,
-                    null,
-                    XPathResult.FIRST_ORDERED_NODE_TYPE,
-                    null
-                ).singleNodeValue;
-                
-                if (oddsEl) {
-                    oddsValue = oddsEl.textContent.trim().replace(',', '.');
-                    break;
-                }
-                current = current.parentNode;
-            }
-            
-            if (label && oddsValue) {
-                outcomes.push(`${label} : ${oddsValue}`);
-            }
-        }
-        
-        if (outcomes.length === 0) return null;
-        return {
-            title: title,
-            odds: outcomes
-        };
-    }
-
-    // Extract odds from player-market sections where each team has players
-    // and odds are in columns (e.g., Buteur/Passeur/Décisif).
-    async function extractPlayerMarketOdds(sectionContainer, title) {
-        // Find team-split containers (direct child divs of bet-group-template)
-        const teamContainers = xpathNodes(
-            ".//*[contains(@class, 'bet-group-template')]/div",
-            sectionContainer
-        );
-
-        // Extract column header from the bet-group-template header row, if present
-        let columnHeaders = [];
-        // Find header row using more resilient XPath
-        const headerRow = document.evaluate(
-            ".//*[contains(@class, 'bet-group-template')]/*[1][self::div or self::header]",
-            sectionContainer, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
-        ).singleNodeValue;
-        if (headerRow) {
-            const headerCells = xpathNodes(".//p", headerRow);
-            columnHeaders = headerCells.map(c => c.textContent.trim());
-        }
-
-        // --- Helper: collect all odds for a single player block ----------
-        // Collects from ALL threshold wrappers inside the block (e.g. "paliers" sections
-
-        function collectPlayerOdds(playerBlock) {
-            // Find odds wrappers by their relationship to odd buttons
-            const oddsWrappers = xpathNodes(
-                ".//div[.//div[starts-with(@data-testid, 'odd-button-')]]",
-                playerBlock
-            );
-
-            // If we have column headers from a header row, treat this as a
-            // column-based market: take only the first wrapper (3 columns).
-            if (columnHeaders.length > 0) {
-                const wrapper = oddsWrappers.length > 0 ? oddsWrappers[0] : playerBlock;
-                const oddButtons = xpathNodes(
-                    ".//div[starts-with(@data-testid, 'odd-button-')]",
-                    wrapper
-                );
-                const values = [];
-                for (const btn of oddButtons) {
-                    const span = document.evaluate(
-                        ".//span[contains(@class, 'odd-button-value')]",
-                        btn, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
-                    ).singleNodeValue;
-                    if (span) values.push(span.textContent.trim().replace(',', '.'));
-                }
-                const parts = values.map((v, i) => {
-                    const colName = (i < columnHeaders.length) ? columnHeaders[i] : `Col${i+1}`;
-                    return `${colName}: ${v}`;
-                });
-                return parts.length > 0 ? parts.join(' | ') : '';
-            }
-
-            // No column headers → this is a threshold/paliers market with multiple wrappers.
-            // Collect ALL odds from ALL wrappers, prefixing each with its outcome name.
-            const allOdds = [];
-            for (const wrapper of oddsWrappers) {
-                const oddButtons = xpathNodes(
-                    ".//div[starts-with(@data-testid, 'odd-button-')]",
-                    wrapper
-                );
-                for (const btn of oddButtons) {
-                    const valueSpan = document.evaluate(
-                        ".//span[contains(@class, 'odd-button-value')]",
-                        btn, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
-                    ).singleNodeValue;
-                    if (!valueSpan) continue;
-                    const oddValue = valueSpan.textContent.trim().replace(',', '.');
-
-                    // Get outcome name (e.g. "Plus de 9,5") – Strategy 1: sibling
-                    let outcomeName = '';
-                    const valueContainer = valueSpan.parentElement;
-                    if (valueContainer && valueContainer.previousElementSibling) {
-                        outcomeName = valueContainer.previousElementSibling.textContent.trim();
-                    }
-                    // Strategy 2: Look for common title/name div/span classes inside the button itself
-                    if (!outcomeName) {
-                        const nameDiv = document.evaluate(
-                            ".//*[contains(@class, 'odd-button-name') or contains(@class, 'outcome-name')]",
-                            btn, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
-                        ).singleNodeValue;
-                        if (nameDiv) outcomeName = nameDiv.textContent.trim();
-                    }
-
-                    if (outcomeName && oddValue) {
-                        allOdds.push(`${outcomeName} : ${oddValue}`);
-                    }
-                }
-            }
-            return allOdds.join(' | ');
-        }
-
-        // --- Helper: find the player block DOM node containing a player name element
-        function findPlayerBlock(nameEl, boundary) {
-            // Walk up the DOM tree to find a container that has both the player name and odds buttons
-            let cur = nameEl.parentNode;
-            while (cur && cur !== boundary) {
-                if (document.evaluate(
-                    ".//div[starts-with(@data-testid, 'odd-button-')]",
-                    cur, null, XPathResult.BOOLEAN_TYPE, null
-                ).booleanValue) return cur;
-                cur = cur.parentNode;
-            }
-            return nameEl.parentNode;
-        }
-
-        // --- Case 1: Team-split format (e.g. "Joueur décisif") -------------
-        if (teamContainers.length > 0) {
-            const sectionOdds = [];
-            for (const teamContainer of teamContainers) {
-                // Team name: find the first text element that looks like a team name
-                // within the team container (direct child of bet-group-template)
-                const teamNameEl = document.evaluate(
-                    ".//*[self::p or self::span or self::div][string-length(normalize-space(text())) > 1 and not(contains(text(), 'Plus de sélections')) and not(contains(text(), 'paliers')) and not(contains(text(), 'ATP')) and not(contains(text(), 'WTA'))]",
-                    teamContainer, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
-                ).singleNodeValue;
-                const teamName = teamNameEl ? teamNameEl.textContent.trim() : '';
-
-                // Player names: find text elements that look like player names
-                // (capitalized, not tournament/round/time indicators)
-                const playerNameElements = xpathNodes(
-                    ".//*[self::p or self::span or self::div][string-length(normalize-space(text())) > 1 and contains(text(), ' ') and not(contains(text(), ':')) and not(contains(text(), 'ATP')) and not(contains(text(), 'WTA')) and not(contains(text(), 'Plus de')) and not(contains(text(), 'Moins de'))]",
-                    teamContainer
-                );
-
-                for (const nameEl of playerNameElements) {
-                    const playerName = nameEl.textContent.trim();
-                    if (!playerName) continue;
-                    const playerBlock = findPlayerBlock(nameEl, teamContainer);
-                    if (!playerBlock) continue;
-                    const oddsStr = collectPlayerOdds(playerBlock);
-                    if (oddsStr) {
-                        sectionOdds.push(`  ${playerName} | ${oddsStr}`);
-                    }
-                }
-            }
-
-            // Rebuild with team separation
-            const outputLines = [];
-            // If there's exactly 1 container with no team name, skip team header
-            const isSingleUntitledContainer = teamContainers.length === 1 &&
-                !document.evaluate(
-                    ".//*[self::p or self::span or self::div][string-length(normalize-space(text())) > 1 and not(contains(text(), 'Plus de sélections')) and not(contains(text(), 'paliers')) and not(contains(text(), 'ATP')) and not(contains(text(), 'WTA'))]",
-                    teamContainers[0], null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
-                ).singleNodeValue;
-
-            if (isSingleUntitledContainer) {
-                // Direct player output (no team header)
-                for (const item of sectionOdds) {
-                    outputLines.push(item);
-                }
-            } else {
-                // Standard team-split output
-                let playerIndex = 0;
-                for (const teamContainer of teamContainers) {
-                    const teamNameEl = document.evaluate(
-                        ".//*[self::p or self::span or self::div][string-length(normalize-space(text())) > 1 and not(contains(text(), 'Plus de sélections')) and not(contains(text(), 'paliers')) and not(contains(text(), 'ATP')) and not(contains(text(), 'WTA'))]",
-                        teamContainer, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
-                    ).singleNodeValue;
-                    const teamName = teamNameEl ? teamNameEl.textContent.trim() : '';
-                    const playerCount = xpathNodes(
-                        ".//*[self::p or self::span or self::div][string-length(normalize-space(text())) > 1 and contains(text(), ' ') and not(contains(text(), ':')) and not(contains(text(), 'ATP')) and not(contains(text(), 'WTA')) and not(contains(text(), 'Plus de')) and not(contains(text(), 'Moins de'))]",
-                        teamContainer
-                    ).length;
-                    if (playerCount > 0 && teamName) {
-                        outputLines.push(`=== ${teamName} ===`);
-                    }
-                    for (let i = 0; i < playerCount && playerIndex < sectionOdds.length; i++) {
-                        outputLines.push(sectionOdds[playerIndex]);
-                        playerIndex++;
-                    }
-                }
-            }
-            if (outputLines.length > 0) return { title, odds: outputLines };
-            return null;
-        }
-
-        // --- Case 2: Direct player blocks inside bet-group-template ---------
-        // (e.g. "Nombre de points du joueur (paliers)" — no team split)
-        // Find player blocks: they are descendants of bet-group-template that contain both
-        // a player name (text with space, capitalized) and odds buttons
-        const candidateBlocks = xpathNodes(
-            ".//*[contains(@class, 'bet-group-template')]//*[.//div[starts-with(@data-testid, 'odd-button-')]]",
-            sectionContainer
-        );
-        const playerBlocks = [];
-        for (const block of candidateBlocks) {
-            // Check if this block contains a player name (text with space, not containing special chars)
-            const hasPlayerName = document.evaluate(
-                ".//*[self::p or self::span or self::div][string-length(normalize-space(text())) > 1 and contains(text(), ' ') and not(contains(text(), ':')) and not(contains(text(), 'ATP')) and not(contains(text(), 'WTA')) and not(contains(text(), 'Plus de')) and not(contains(text(), 'Moins de'))]",
-                block, null, XPathResult.BOOLEAN_TYPE, null
-            ).booleanValue;
-            if (hasPlayerName) {
-                playerBlocks.push(block);
-            }
-        }
-        if (playerBlocks.length === 0) return null;
-
-        const outputLines = [];
-        for (const playerBlock of playerBlocks) {
-            const playerNameEl = document.evaluate(
-                ".//*[self::p or self::span or self::div][string-length(normalize-space(text())) > 1 and contains(text(), ' ') and not(contains(text(), ':')) and not(contains(text(), 'ATP')) and not(contains(text(), 'WTA')) and not(contains(text(), 'Plus de')) and not(contains(text(), 'Moins de'))]",
-                playerBlock, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
-            ).singleNodeValue;
-            const playerName = playerNameEl ? playerNameEl.textContent.trim() : '';
-            if (!playerName) continue;
-            const oddsStr = collectPlayerOdds(playerBlock);
-            if (oddsStr) {
-                outputLines.push(`  ${playerName} | ${oddsStr}`);
-            }
-        }
-
-        if (outputLines.length === 0) return null;
-        return { title, odds: outputLines };
-    }
-
-    // Extract odds from a section: expand it, then extract, return {title, odds[]} or null
-    // Optional filter: 'over', 'under', player name string, or null for all odds
-    async function extractSectionData(headingEl, filter = null) {
-        const title = headingEl.dataset.originalTitle || headingEl.textContent.trim();
-        if (!title || title.length < 2) return null;
-
-        // Navigate up to find section container (the node that contains odds)
-        let sectionContainer = null;
-        let node = headingEl.parentNode;
-        while (node && node !== document.body) {
-            const hasOdds = document.evaluate(".//div[starts-with(@data-testid, 'odd-button-')]", node, null, XPathResult.BOOLEAN_TYPE, null).booleanValue;
-            if (hasOdds) { sectionContainer = node; break; }
-            node = node.parentNode;
-        }
-        if (!sectionContainer) return null;
-
-        // Helper to find sub-group title for an odd button using resilient DOM traversal
-        function findGroupTitle(btn, sectionTitle, sectionContainer) {
-            let current = btn.parentNode;
-            while (current && current !== sectionContainer) {
-                // If this container doesn't hold multiple odd buttons, it's likely just a single cell layout,
-                // and any text is just the outcome label, not a sub-group header.
-                const oddButtonsInCurrent = current.querySelectorAll('[data-testid^="odd-button-"]');
-                if (oddButtonsInCurrent.length <= 1) {
-                    current = current.parentNode;
-                    continue;
-                }
-
-                const walker = document.createTreeWalker(current, NodeFilter.SHOW_TEXT);
-                const candidates = [];
-                while (walker.nextNode()) {
-                    const text = walker.currentNode.textContent.trim();
-                    if (!text) continue;
-                    
-                    // Ignore if the text is inside an odd button or represents odds/percentages
-                    let isInsideBtnOrNoise = false;
-                    let node = walker.currentNode.parentNode;
-                    while (node && node !== current) {
-                        if (node.dataset && node.dataset.testid && node.dataset.testid.startsWith('odd-button-')) {
-                            isInsideBtnOrNoise = true;
-                            break;
-                        }
-                        // Skip if the parent class suggests it's an odds value or distribution
-                        const className = node.className || '';
-                        if (typeof className === 'string' && (
-                            className.includes('odd-button-value') || 
-                            className.includes('percent-distribution') ||
-                            className.includes('completeness')
-                        )) {
-                            isInsideBtnOrNoise = true;
-                            break;
-                        }
-                        node = node.parentNode;
-                    }
-                    
-                    if (isInsideBtnOrNoise) continue;
-                    
-                    // Filter out standard option names and values
-                    if (text === 'Oui' || text === 'Non' || text === '1' || text === 'N' || text === '2') continue;
-                    if (/^\d+([.,]\d+)?%?$/.test(text)) continue; // numbers or percentages
-                    if (text.toLowerCase() === sectionTitle.toLowerCase()) continue;
-                    if (/^(Extract|Plus de|Moins de|Titulaire|Nouveau|NEW|\?)/i.test(text)) continue;
-                    
-                    candidates.push(text);
-                }
-                
-                if (candidates.length > 0) {
-                    return candidates[0];
-                }
-                current = current.parentNode;
-            }
-            return '';
-        }
-
-        // Expand the section
-        await expandSection(sectionContainer);
-
-        // Special handling for "Double chance" sections
-        if (title.toLowerCase().includes('chance')) {
-            await sleep(300); // Wait for expansion to complete
-            const oddsData = extractDoubleChanceOdds(sectionContainer, title);
-            if (oddsData) return oddsData;
-        }
-
-        // Detect if this is a player-market section (e.g., "Joueur décisif")
-        // These have a bet-group-template layout with team sub-sections and columns
-        // BUT exclude "Score exact" sections which also use bet-group-template but have score outcomes (1-0, 2-0, etc.)
-        const isScoreExact = title.toLowerCase().includes('score exact');
-        if (!isScoreExact && isPlayerMarketSection(sectionContainer)) {
-            // Wait a moment after expansion for DOM to settle
-            await sleep(300);
-            const playerData = await extractPlayerMarketOdds(sectionContainer, title);
-            if (playerData) return playerData;
-            // Fall through to standard extraction if player mode fails
-        }
-
-        // Extract odds from this section
-        const oddsButtons = xpathNodes(".//div[starts-with(@data-testid, 'odd-button-')]", sectionContainer);
-        if (oddsButtons.length === 0) return null;
-
-        // Collect raw odds as structured objects first
-        const rawOdds = [];
-        for (const btn of oddsButtons) {
-            const valueSpan = document.evaluate(".//span[contains(@class, 'odd-button-value')]", btn, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-            if (!valueSpan) continue;
-            let oddValue = valueSpan.textContent.trim();
-            const valueContainer = valueSpan.parentElement;
-            
-            let name = '';
-            // Strategy 1: Sibling of valueSpan's parent inside the button wrapper
-            const nameDiv = valueContainer ? valueContainer.previousElementSibling : null;
-            if (nameDiv) {
-                name = nameDiv.textContent.trim();
-            }
-
-            // Strategy 2: Look for common title/name div classes inside the button itself
-            if (!name) {
-                const possibleNameDiv = document.evaluate(
-                    ".//*[contains(@class, 'odd-button-name') or contains(@class, 'outcome-name')]",
-                    btn, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
-                ).singleNodeValue;
-                if (possibleNameDiv) name = possibleNameDiv.textContent.trim();
-            }
-
-            // Strategy 3: Sibling/Parent row container lookup (for outcomes with labels and odds separated)
-            // IMPORTANT: Only use 'label-text' class - broader selectors like 'bet-group-outcome-title'
-            // would match container elements that also contain percentage distribution text (e.g. "21%"),
-            // causing the percentage to be concatenated with the label (e.g. "B. Krejcikova et moins de 21,521%").
-            if (!name) {
-                let current = btn.parentNode;
-                for (let depth = 0; depth < 5 && current && current !== sectionContainer; depth++) {
-                    const labelNode = document.evaluate(
-                        ".//*[contains(@class, 'label-text')]",
-                        current, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
-                    ).singleNodeValue;
-                    if (labelNode) {
-                        // Clean label: remove trailing percentage (e.g. "21%") and distribution text
-                        const text = labelNode.textContent.trim();
-                        name = text.replace(/\s*\d+([.,]\d+)?%$/, '').trim();
-                        break;
-                    }
-                    current = current.parentNode;
-                }
-            }
-
-            // Strategy 4: Ultimate text-walking fallback inside row wrapper
-            // Find the row wrapper by looking for a common ancestor that contains
-            // both the odd button and other text nodes (outcome name, etc.)
-            if (!name) {
-                // Walk up to find a container that has the button and other text content
-                let rowWrapper = btn.parentNode;
-                for (let depth = 0; depth < 6 && rowWrapper && rowWrapper !== sectionContainer; depth++) {
-                    const textCount = document.evaluate(
-                        "count(.//text()[normalize-space(.) != ''])",
-                        rowWrapper, null, XPathResult.NUMBER_TYPE, null
-                    ).numberValue;
-                    if (textCount > 2) break; // Found a wrapper with multiple text nodes
-                    rowWrapper = rowWrapper.parentNode;
-                }
-                if (rowWrapper && rowWrapper !== sectionContainer) {
-                    const textNodes = [];
-                    const walker = document.createTreeWalker(rowWrapper, NodeFilter.SHOW_TEXT);
-                    while (walker.nextNode()) {
-                        const val = walker.currentNode.textContent.trim();
-                        // Ignore current odd values or percentage distributions
-                        if (val && val !== oddValue && val !== oddValue.replace('.', ',') && !val.endsWith('%')) {
-                            textNodes.push(val);
-                        }
-                    }
-                    if (textNodes.length > 0) {
-                        name = textNodes[0];
-                    }
-                }
-            }
-
-            if (name && oddValue) {
-                const groupTitle = findGroupTitle(btn, title, sectionContainer);
-                rawOdds.push({ name, value: oddValue.replace(',', '.'), groupTitle });
-            }
-        }
-
-        if (rawOdds.length === 0) return null;
-
-        // Detect if odds are spread-type (Player Name +N.N or -N.N) and group by player
-        const spreadRegex = /^(.+?)\s+([+-]\d+(?:[.,]\d+)?)$/;
-        let spreadCount = 0;
-        const byPlayer = {};
-        for (const o of rawOdds) {
-            const match = o.name.match(spreadRegex);
-            if (match) {
-                spreadCount++;
-                const playerName = match[1].trim();
-                const handicap = match[2];
-                if (!byPlayer[playerName]) byPlayer[playerName] = [];
-                byPlayer[playerName].push({
-                    sortKey: parseFloat(handicap.replace(',', '.')),
-                    text: `${o.name} : ${o.value}`
-                });
-            }
-        }
-
-        // Build final odds array
-        const sectionOdds = [];
-
-        // "Nombre de jeux" and "Écart de jeux" sections: group by Over/Under sorted by odd value ascending
-        if (title.includes('Nombre de jeux') || title.includes('Écart de jeux')) {
-            const overOdds = rawOdds.filter(o => o.name.includes('Plus de'));
-            const underOdds = rawOdds.filter(o => o.name.includes('Moins de'));
-            const sortByValue = (a, b) => parseFloat(a.value) - parseFloat(b.value);
-            overOdds.sort(sortByValue);
-            underOdds.sort(sortByValue);
-
-            // Apply filter if provided
-            if (title.includes('Nombre de jeux')) {
-                // "Nombre de jeux": filter is 'over' or 'under'
-                if (filter === 'over') {
-                    for (const o of overOdds) {
-                        const threshold = o.name.replace('Plus de ', '');
-                        sectionOdds.push(`Over ${threshold} : ${o.value}`);
-                    }
-                } else if (filter === 'under') {
-                    for (const o of underOdds) {
-                        const threshold = o.name.replace('Moins de ', '');
-                        sectionOdds.push(`Under ${threshold} : ${o.value}`);
-                    }
-                } else {
-                    for (const o of overOdds) {
-                        const threshold = o.name.replace('Plus de ', '');
-                        sectionOdds.push(`Over ${threshold} jeux : ${o.value}`);
-                    }
-                    for (const o of underOdds) {
-                        const threshold = o.name.replace('Moins de ', '');
-                        sectionOdds.push(`Under ${threshold} jeux : ${o.value}`);
-                    }
-                }
-            } else if (title.includes('Écart de jeux')) {
-                // "Écart de jeux": group by player, sorted by odds value ascending (like Over/Under)
-                const playerNames = getMiddleColumnPlayers();
-                const p1 = playerNames && playerNames.length >= 2 ? playerNames[0] : null;
-                const p2 = playerNames && playerNames.length >= 2 ? playerNames[1] : null;
-
-                // Build player grouping from spread-format odds ("Player Name +/-N.N")
-                const ecartByPlayer = {};
-                for (const o of rawOdds) {
-                    const spreadMatch = o.name.match(spreadRegex);
-                    const playerNamePart = spreadMatch ? spreadMatch[1].trim() : o.name;
-                    if (!ecartByPlayer[playerNamePart]) ecartByPlayer[playerNamePart] = [];
-                    ecartByPlayer[playerNamePart].push(o);
-                }
-
-                // Determine which players to include based on filter
-                let playersToShow = Object.keys(ecartByPlayer);
-                if (filter && p1 && p2 && (filter === p1 || filter === p2)) {
-                    playersToShow = playersToShow.filter(p => p.includes(filter));
-                }
-                playersToShow.sort();
-
-                for (const player of playersToShow) {
-                    // Sort by odds value ascending
-                    ecartByPlayer[player].sort((a, b) => parseFloat(a.value) - parseFloat(b.value));
-                    for (const o of ecartByPlayer[player]) {
-                        sectionOdds.push(`${o.name} : ${o.value}`);
-                    }
-                }
-            }
-        } else if (spreadCount > rawOdds.length / 2) {
-            // Spread-type section: group by player, sorted by handicap
-            const sortedPlayers = Object.keys(byPlayer).sort();
-            for (const player of sortedPlayers) {
-                byPlayer[player].sort((a, b) => a.sortKey - b.sortKey);
-                for (const odd of byPlayer[player]) {
-                    sectionOdds.push(odd.text);
-                }
-            }
-        } else {
-            // General section: group by groupTitle (preserving order)
-            const groups = new Map();
-            for (const o of rawOdds) {
-                if (!groups.has(o.groupTitle)) {
-                    groups.set(o.groupTitle, []);
-                }
-                groups.get(o.groupTitle).push(o);
-            }
-            
-            for (const [groupTitle, groupOdds] of groups.entries()) {
-                if (groupTitle) {
-                    sectionOdds.push(groupTitle);
-                }
-                for (const o of groupOdds) {
-                    sectionOdds.push(`${o.name} : ${o.value}`);
-                }
-            }
-        }
-
-        if (sectionOdds.length === 0) return null;
-        return { title, odds: sectionOdds };
-    }
-
-    async function extractAllOddsFromMatch() {
-        try {
-            showProgress('🔍 Scanning sections while scrolling...');
-            
-            const scrollable = findScrollableContainer();
-            const allResults = [];
-            const processedButtons = new WeakSet();
-
-            // Ensure all currently visible sections have their "Extract" button injected
-            injectSectionExtractButtons();
-
-            // Start from top
-            if (scrollable === window) {
-                window.scrollTo(0, 0);
-            } else {
-                scrollable.scrollTop = 0;
-            }
-            await sleep(300);
-
-            let prevScrollTop = -1;
-            let noNewSectionsCount = 0;
-            const MAX_NO_NEW = 15;
-
-            while (noNewSectionsCount < MAX_NO_NEW) {
-                // Ensure all sections currently in the DOM have "Extract" buttons injected
-                injectSectionExtractButtons();
-
-                // Find injected "Extract" buttons that we haven't processed yet
-                const extractBtns = document.querySelectorAll('[data-section-extract="true"]');
-                let foundNew = false;
-
-                for (const btn of extractBtns) {
-                    if (processedButtons.has(btn)) continue;
-
-                    const headingEl = btn.parentNode;
-                    if (!headingEl || !headingEl.dataset.originalTitle) continue;
-
-                    processedButtons.add(btn);
-
-                    const data = await extractSectionData(headingEl);
-                    if (data) {
-                        const isOverUnderType = data.title.includes('Nombre de jeux') || data.title.includes('Écart de jeux');
-                        if (!isOverUnderType) {
-                            allResults.push(data.title);
-                        }
-                        allResults.push(...data.odds);
-                        allResults.push('');
-                        foundNew = true;
-                    }
-                }
-
-                if (foundNew) {
-                    noNewSectionsCount = 0;
-                } else {
-                    noNewSectionsCount++;
-                }
-
-                // Scroll down
-                const oldScrollTop = (scrollable === window) ? window.scrollY : scrollable.scrollTop;
-                if (scrollable === window) {
-                    window.scrollBy(0, 500);
-                } else {
-                    scrollable.scrollBy({ top: 500, behavior: 'auto' });
-                }
-                await sleep(250);
-                const newScrollTop = (scrollable === window) ? window.scrollY : scrollable.scrollTop;
-                if (newScrollTop === oldScrollTop && prevScrollTop === newScrollTop) break;
-                prevScrollTop = oldScrollTop;
-
-                if (scrollable === window) {
-                    if (window.innerHeight + window.scrollY >= document.body.scrollHeight - 100) break;
-                } else {
-                    if (scrollable.scrollTop + scrollable.clientHeight >= scrollable.scrollHeight - 100) break;
-                }
-            }
-
-            // Remove trailing blank line
-            while (allResults.length > 0 && allResults[allResults.length - 1] === '') {
-                allResults.pop();
-            }
-
-            if (allResults.length === 0) throw new Error("No odds extracted from any section");
-
-            const output = allResults.join('\n');
-            await copyToClipboard(output);
-            const oddCount = output.split('\n').filter(line => line.includes(':')).length;
-            const sectionCount = output.split('\n').filter(line => line !== '' && !line.includes(':')).length;
-            showProgress(`✅ ${oddCount} odds from ${sectionCount} sections copied!`);
-        } catch (err) {
-            console.error(err);
-            showProgress(`❌ Error: ${err.message}`, true);
-        }
-    }
-
-    // --- Sports page extraction (upcoming singles) ----------------------
-    const dayIndicators = ['demain', 'sam', 'dim', 'lun', 'mar', 'mer', 'jeu', 'ven'];
-    function isDayIndicator(text) {
-        const lower = text.toLowerCase();
-        return dayIndicators.some(ind => lower === ind || lower.startsWith(ind + '.'));
-    }
-
-    function looksLikePlayerName(text) {
-        if (!text || text.length < 2) return false;
-        if (/^\d+(?:[.,]\d+)?$/.test(text)) return false;
-        if (isDayIndicator(text)) return false;
-        return /[A-ZÀ-ÖØ-öø-ÿ]/.test(text) || /^[a-zA-ZÀ-ÖØ-öø-ÿ\s.-]{2,}$/.test(text);
-    }
-
-    function extractMatchInfo(card) {
-        const texts = [];
-        const walker = document.createTreeWalker(card, NodeFilter.SHOW_TEXT);
-        while (walker.nextNode()) {
-            let text = walker.currentNode.textContent.trim();
-            if (text.length > 0) texts.push(text);
-        }
-
-        let tournamentIdx = -1;
-        for (let i = 0; i < texts.length; i++) {
-            if (texts[i].includes('ATP') || texts[i].includes('WTA')) { tournamentIdx = i; break; }
-        }
-        if (tournamentIdx === -1) return null;
-
-        let tournament = texts[tournamentIdx];
-        tournament = tournament.replace(/\s+\d+(?:[.,]\d+)?$/, '').trim();
-
-        if (tournament.toLowerCase().includes('double')) return null;
-
-        let timeIdx = -1;
-        let dayIndicator = '';
-        for (let i = 0; i < texts.length; i++) {
-            const t = texts[i];
-            if (/^\d{1,2}:\d{2}$/.test(t)) {
-                timeIdx = i;
-                if (i > 0 && isDayIndicator(texts[i-1])) dayIndicator = texts[i-1];
-                break;
-            }
-        }
-        if (timeIdx === -1) return null;
-
-        const matchTime = texts[timeIdx];
-
-        let player1 = '';
-        for (let i = timeIdx - 1; i >= 0; i--) {
-            const t = texts[i];
-            if (isDayIndicator(t)) continue;
-            if (looksLikePlayerName(t)) { player1 = t; break; }
-        }
-
-        let player2 = '';
-        for (let i = timeIdx + 1; i < texts.length; i++) {
-            const t = texts[i];
-            if (looksLikePlayerName(t)) { player2 = t; break; }
-        }
-
-        if (!player1 || !player2 || player1 === player2) return null;
-
-        let round = '';
-        for (let i = tournamentIdx + 1; i < texts.length; i++) {
-            const t = texts[i];
-            if (/^\d{1,2}:\d{2}$/.test(t)) break;
-            if (looksLikePlayerName(t)) break;
-            if (!isDayIndicator(t) && t !== tournament && !t.includes('ATP') && !t.includes('WTA')) {
-                round = t;
-                break;
-            }
-        }
-
-        return { tournament, round, player1, player2, matchTime, dayIndicator };
-    }
-
-    function extractCurrentMatches() {
-        const matches = [];
-        const cards = xpathNodes("//*[starts-with(@data-testid, 'match-card-')]");
-        for (const card of cards) {
-            try {
-                const info = extractMatchInfo(card);
-                if (info) matches.push(info);
-            } catch (err) { console.warn(err); }
-        }
-        return matches;
-    }
-
-    function timeToMinutes(timeStr) {
-        const parts = timeStr.split(':');
-        return parseInt(parts[0], 10) * 60 + parseInt(parts[1], 10);
-    }
-
-    async function extractAllMatchesFromSports(onProgress) {
-        const todayMatches = new Map();
-        const allSeen = new Map();
-        const scrollable = findScrollableContainer();
-        const NIGHT_GAP_THRESHOLD = 360; // 6 hours in minutes
-        let stoppedByNightGap = false;
-        let lastRawMinutes = -1;
-        let lastNormalized = -1;
-        let dayOffset = 0;
-
-        function shouldKeepMatch(m) {
-            const raw = timeToMinutes(m.matchTime);
-            let normalized = raw;
-
-            if (lastRawMinutes === -1) {
-                // First match — initialise
-                lastRawMinutes = raw;
-                lastNormalized = raw;
-                return true;
-            }
-
-            // Handle midnight wrap: if clock goes backwards, add 24h
-            if (raw < lastRawMinutes) {
-                dayOffset += 1440;
-            }
-            normalized = raw + dayOffset;
-
-            const gap = normalized - lastNormalized;
-            if (gap > NIGHT_GAP_THRESHOLD && sportsScanLimit) {
-                stoppedByNightGap = true;
-                return false; // This match is the first of the next session
-            }
-
-            lastRawMinutes = raw;
-            lastNormalized = normalized;
-            return true;
-        }
-
-        // Process initial visible matches
-        let initialMatches = extractCurrentMatches();
-        for (let m of initialMatches) {
-            const key = `${m.player1}|${m.player2}|${m.tournament}|${m.round}`;
-            allSeen.set(key, m);
-            if (stoppedByNightGap) continue;
-            if (shouldKeepMatch(m)) {
-                todayMatches.set(key, m);
-            }
-        }
-        if (onProgress) onProgress(todayMatches.size);
-
-        if (stoppedByNightGap) {
-            return Array.from(todayMatches.values());
-        }
-
-        let noNewCount = 0;
-        const MAX_NO_NEW = 8;
-        const originalScrollTop = (scrollable === window) ? window.scrollY : scrollable.scrollTop;
-
-        while (noNewCount < MAX_NO_NEW && !stoppedByNightGap) {
-            let oldScrollTop = (scrollable === window) ? window.scrollY : scrollable.scrollTop;
-            if (scrollable === window) window.scrollBy(0, 1000);
-            else scrollable.scrollBy({ top: 1000, behavior: 'auto' });
-
-            await sleep(100);
-
-            let newScrollTop = (scrollable === window) ? window.scrollY : scrollable.scrollTop;
-            if (newScrollTop === oldScrollTop) break;
-
-            const newMatches = extractCurrentMatches();
-            let added = 0;
-            for (let m of newMatches) {
-                const key = `${m.player1}|${m.player2}|${m.tournament}|${m.round}`;
-                if (allSeen.has(key)) continue;
-                allSeen.set(key, m);
-
-                if (stoppedByNightGap) continue;
-
-                if (shouldKeepMatch(m)) {
-                    todayMatches.set(key, m);
-                    added++;
-                }
-            }
-            if (added === 0) noNewCount++;
-            else noNewCount = 0;
-
-            if (onProgress) onProgress(todayMatches.size);
-
-            let atBottom = (scrollable === window) ?
-                (window.innerHeight + window.scrollY >= document.body.scrollHeight - 100) :
-                (scrollable.scrollTop + scrollable.clientHeight >= scrollable.scrollHeight - 100);
-            if (atBottom) break;
-        }
-
-        if (scrollable === window) window.scrollTo(0, originalScrollTop);
-        else scrollable.scrollTop = originalScrollTop;
-
-        return Array.from(todayMatches.values());
-    }
-
-    function formatMatches(matches) {
-        return matches.map(m => {
-            const suffix = m.round ? ` - ${m.round}` : '';
-            return `${m.player1} vs ${m.player2} (${m.tournament}${suffix})`;
-        }).join('\n');
-    }
-
+// ----- [original script.js lines 1400-1437] -----
     async function handleSportsExtract() {
         if (!actionBtn || actionBtn.disabled) return;
         actionBtn.disabled = true;
@@ -1406,8 +1366,11 @@
         actionBtn.textContent = '⏳ Scanning...';
 
         try {
-            extractedMatches = await extractAllMatchesFromSports((count) => {
-                showProgress(`📡 Scanning... ${count} match${count !== 1 ? 'es' : ''} found so far`);
+            extractedMatches = await WinamaxCore.scanMatches({
+                stopAtNightGap: sportsScanLimit,
+                onProgress: (count) => {
+                    showProgress(`📡 Scanning... ${count} match${count !== 1 ? 'es' : ''} found so far`);
+                }
             });
 
             if (!extractedMatches.length) {
@@ -1419,7 +1382,7 @@
                 return;
             }
 
-            const formatted = formatMatches(extractedMatches);
+            const formatted = WinamaxCore.formatMatches(extractedMatches);
             await copyToClipboard(formatted);
 
             showProgress(`✅ Found ${extractedMatches.length} match${extractedMatches.length > 1 ? 'es' : ''}. Copied to clipboard!`);
@@ -1435,7 +1398,7 @@
             }
         }
     }
-
+// ----- [original script.js lines 1439-1661] -----
     // --- UI Creation / Destruction --------------------------------------
     function removeUI() {
         if (uiContainer && uiContainer.parentNode) uiContainer.parentNode.removeChild(uiContainer);
@@ -1584,6 +1547,25 @@
         });
     }
 
+    // "Extract all odds": ask the shared core for structured odds while
+    // scrolling, format them as the legacy clipboard text, and copy.
+    async function handleMatchExtractAll() {
+        try {
+            showProgress('🔍 Scanning sections while scrolling...');
+            const odds = await WinamaxCore.extractOddsJSON();
+            const output = WinamaxCore.formatAllOddsText(odds);
+            if (!output) throw new Error('No odds extracted from any section');
+
+            await copyToClipboard(output);
+            const oddCount = output.split('\n').filter(line => line.includes(':')).length;
+            const sectionCount = output.split('\n').filter(line => line !== '' && !line.includes(':')).length;
+            showProgress(`✅ ${oddCount} odds from ${sectionCount} sections copied!`);
+        } catch (err) {
+            console.error(err);
+            showProgress(`❌ Error: ${err.message}`, true);
+        }
+    }
+
     function createMatchUI() {
         createBaseUI();
         
@@ -1597,7 +1579,7 @@
             actionBtn.style.opacity = '0.7';
             actionBtn.style.cursor = 'wait';
             
-            await extractAllOddsFromMatch();
+            await handleMatchExtractAll();
             
             actionBtn.disabled = false;
             actionBtn.style.opacity = '1';
